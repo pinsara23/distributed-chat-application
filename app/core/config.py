@@ -1,5 +1,8 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+"""We never want to read os.getenv() randomly throughout our code. 
+We will use Pydantic's BaseSettings to load and validate our .env variables right when the app starts."""
+
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Distributed Chat Stage 1"
 
