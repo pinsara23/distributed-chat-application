@@ -27,3 +27,11 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
         algorithm=settings.JWT_ALGORITHM
     )
     return encoded_jwt
+
+"""
+data is a dictionary,
+first make a copy of it then,
+we add key: exp -> value: expire time to it,
+       key: sub -> value: user_id to it
+then we encode it using jwt.encode() with the secret key and algorithm specified in settings.
+"""

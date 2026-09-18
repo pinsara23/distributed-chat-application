@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from app.api import auth
+from app.api import auth, conversations # Added conversations import
 
 app = FastAPI(
     title="Distributed Chat API (Stage 1)",
@@ -7,8 +7,9 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Include our routers
 app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
+# Add the new router here
+app.include_router(conversations.router, prefix="/conversations", tags=["Conversations"]) 
 
 @app.get("/")
 async def root():

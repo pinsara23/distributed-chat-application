@@ -45,7 +45,7 @@ class AuthService:
         result = await self.db.execute(select(User).where(User.username == username))
         user = result.scalars().first()
 
-        if not user or not verify_password(password, user.password_hash):
+        if not user or not verifyPassword(password, user.password_hash):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid username or password",
