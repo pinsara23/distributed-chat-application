@@ -11,23 +11,32 @@ from app.services.chat_service import ChatService
 
 router = APIRouter()
 
+# --- Connection Manager ---
 class ConnectionManager:
     def __init__(self):
         self.active_connections: dict[int, WebSocket] = {}
 
     async def connect(self, user_id: int, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections[user_id] = websocket
+        # Strictly cast to int
+        self.active_connections[int(user_id)] = websocket
+        #print(f"DEBUG MANAGER: User {user_id} added. Keys: {self.active_connections.keys()}")
 
     def disconnect(self, user_id: int):
-        if user_id in self.active_connections:
-            del self.active_connections[user_id]
+        safe_id = int(user_id)
+        if safe_id in self.active_connections:
+            del self.active_connections[safe_id]
 
-    async def send_personal_message(self, target_user_id: int, message: str):
-        # only send if user currently online
-        if target_user_id in self.active_connections:
-            websocket = self.active_connections[target_user_id]
+    async def send_personal_message(self, message: str, target_user_id: int):
+        safe_target = int(target_user_id)
+        
+        # Check if the integer key exists in the dictionary
+        if safe_target in self.active_connections:
+            websocket = self.active_connections[safe_target]
             await websocket.send_text(message)
+            #print(f"DEBUG MANAGER: -> Successfully fired send_text() to user {safe_target}")
+        else:
+            print(f"DEBUG MANAGER: -> FAILED! User {safe_target} not found in dictionary!")
 
 manager = ConnectionManager()
 
@@ -64,16 +73,18 @@ async def websocket_endpoint(
             data = await websocket.receive_text()
             payload = json.loads(data)
             
-            conv_id = payload.get("conversation_id")
-            target_id = payload.get("target_user_id")
+            conv_id = int(payload.get("conversation_id"))
+            target_id = int(payload.get("target_user_id"))
             content = payload.get("content")
             
             # 4. Save to PostgreSQL
+            #print(f"DEBUG: Saving message from user {user_id} to DB...")
             saved_msg = await chat_service.save_message(
                 conversation_id=conv_id,
                 sender_id=user_id,
                 content=content
             )
+            #print(f"DEBUG: Message saved! ID: {saved_msg.id}")
             
             # 5. Prepare the outgoing message JSON
             outbound_msg = {
@@ -83,10 +94,15 @@ async def websocket_endpoint(
                 "content": content,
                 "created_at": saved_msg.created_at.isoformat()
             }
+            #print(f"DEBUG: Outbound msg prepared. Active connections: {manager.active_connections.keys()}")
             
             # 6. Push to target (Bob) if online, and echo back to sender (Alice)
+            #print(f"DEBUG: Attempting to send to Bob (Target ID: {target_id})...")
             await manager.send_personal_message(json.dumps(outbound_msg), target_id)
+            
+            #print(f"DEBUG: Attempting to echo to Alice (Sender ID: {user_id})...")
             await manager.send_personal_message(json.dumps(outbound_msg), user_id)
+            #print(f"DEBUG: Cycle complete! Waiting for next message...\n")
             
     except WebSocketDisconnect:
         manager.disconnect(user_id)

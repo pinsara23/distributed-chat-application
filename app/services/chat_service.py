@@ -102,7 +102,7 @@ class ChatService:
 
 
 
-    async def send_message(self, conversation_id: int, sender_id: int, content: str) -> Message:
+    async def save_message(self, conversation_id: int, sender_id: int, content: str) -> Message:
         # verify sender 
         sender = await self.db.execute(
             select(ConversationParticipant)
