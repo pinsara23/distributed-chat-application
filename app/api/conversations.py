@@ -14,19 +14,19 @@ def get_chat_service(db: AsyncSession = Depends(get_db)) -> ChatService:
     return ChatService(db)
 
 @router.post("/", response_model=ConversationResponse)
-def create_conversation(
+async def create_conversation(
     conv_in: ConversationCreate,
     curret_user: User =  Depends(get_current_user),
     chat_service: ChatService = Depends(get_chat_service)
 ):
-    return chat_service.create_or_get_conversation(current_user_id=curret_user.id, target_user_id=conv_in.user_id)
+    return await chat_service.create_or_get_conversation(current_user_id=curret_user.id, target_user_id=conv_in.user_id)
 
 @router.get("/", response_model=list[ConversationResponse])
-def get_conversation(
+async def get_conversation(
     current_user: User = Depends(get_current_user),
     chat_service: ChatService = Depends(get_chat_service)
 ):
-    return chat_service.get_user_conversation(current_user.id) 
+    return await chat_service.get_user_conversation(current_user.id) 
 
 @router.get("/{conversation_id}/messages", response_model=list[MessageResponse])
 async def get_messages(

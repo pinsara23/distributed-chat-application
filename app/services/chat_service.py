@@ -58,6 +58,7 @@ class ChatService:
         await self.db.refresh(new_conv) 
         return new_conv  
 
+
     async def get_user_conversation(self, user_id: int) -> list[Conversation]:
         query = (
             select(Conversation)
@@ -68,6 +69,7 @@ class ChatService:
 
         result = await self.db.execute(query)
         return result.scalars().all()
+
 
     async def get_conversation_messages(self, user_id: int, conversation_id: int, page: int, limit: int) -> list[Message]:
         # 1. Authorization check: Is user a participant of the conversation?
@@ -97,3 +99,35 @@ class ChatService:
         )
         result = await self.db.execute(query)
         return result.scalars().all()
+
+
+
+    async def send_message(self, conversation_id: int, sender_id: int, content: str) -> Message:
+        # verify sender 
+        sender = await self.db.execute(
+            select(ConversationParticipant)
+            .where(
+                and_(
+                    ConversationParticipant.conversation_id == conversation_id,
+                    ConversationParticipant.user_id == sender_id
+                )
+            )
+        )
+
+        if not sender.scalars().first():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to send messages in this conversation.",
+            )
+
+        # create persist the message
+        new_message  = Message(
+            conversation_id = conversation_id,
+            sender_id = sender_id,
+            content = content
+        )
+        self.db.add(new_message)
+        await self.db.commit()
+        await self.db.refresh(new_message)
+
+        return new_message
