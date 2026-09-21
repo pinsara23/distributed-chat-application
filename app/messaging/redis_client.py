@@ -68,3 +68,18 @@ class RedisPublisherManager:
             print(f"[{settings.SERVER_ID}] Redis listener shutting down.")
 
 redis_manager = RedisPublisherManager()
+
+
+
+"""
+Key Concepts in this Code:
+User-Specific Channels: We are using channels like chat:user:35. 
+This prevents every server from having to process every single message in the system. 
+Redis handles the routing efficiently.
+
+The Listener Loop: async for message in self.pubsub.listen() is an infinite asynchronous loop. 
+It runs quietly in the background without blocking the FastAPI HTTP endpoints.
+
+Decoupled Delivery: The subscribe_and_listen function accepts local_websocket_manager as an argument. 
+This connects the Redis network layer strictly to the local memory state.
+"""
