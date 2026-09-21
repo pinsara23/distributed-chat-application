@@ -1,1 +1,18 @@
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+
+Migrations: Initialize the database tables.
+
+Bash
+alembic upgrade head
+Run Server:
+
+Bash
+uvicorn app.main:app --reload
+The API documentation will be available at http://127.0.0.1:8000/docs.
+
+Testing
+The project includes a fully asynchronous Pytest suite using a dedicated test database (chat_test_db).
+Ensure your .env is configured, then run:
+
+Bash
+pytest -v

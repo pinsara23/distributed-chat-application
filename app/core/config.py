@@ -4,7 +4,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 We will use Pydantic's BaseSettings to load and validate our .env variables right when the app starts."""
 
 class Settings(BaseSettings):
-    PROJECT_NAME: str = "Distributed Chat Stage 1"
+    PROJECT_NAME: str = "Distributed Chat Stage 2"
+    VERSION: str = "2.0.0"
+
+    SERVER_ID: str = "chat-server-local"
+    REDIS_URL: str = "redis://localhost:6379/0"
 
     # Database
     POSTGRES_USER: str
