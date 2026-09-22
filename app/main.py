@@ -1,15 +1,36 @@
+import asyncio
 from fastapi import FastAPI
-from app.api import auth, conversations # Added conversations import
-from app.websocket import chat  # Import the chat WebSocket router
+from contextlib import asynccontextmanager
+from app.api import auth, conversations 
+from app.websocket import chat  
+from app.messaging.redis_client import redis_manager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # connect to redis
+    await redis_manager.connect()
+
+    # star the background listner task
+    # pass chat.manager to redis client
+    listner_task = asyncio.create_task(
+        redis_manager.subscribe_and_listen(chat.manager)
+    )
+
+    yield  # This is where the application runs
+
+    #clean up the resources
+    listner_task.cancel()
+    await redis_manager.disconnect()
+
 
 app = FastAPI(
-    title="Distributed Chat API (Stage 1)",
-    description="Secure Single-Server Chat Backend",
-    version="1.0.0"
+    title="Distributed Chat API (Stage 2)",
+    description="Multi-Server Chat Backend with Redis Pub/Sub",
+    version="2.0.0",
+    lifespan=lifespan
 )
 
 app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
-# Add the new router here
 app.include_router(conversations.router, prefix="/conversations", tags=["Conversations"]) 
 app.include_router(chat.router)
 

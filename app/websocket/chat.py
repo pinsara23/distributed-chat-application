@@ -21,7 +21,7 @@ class ConnectionManager:
         await websocket.accept()
         # Strictly cast to int
         self.active_connections[int(user_id)] = websocket
-        #print(f"DEBUG MANAGER: User {user_id} added. Keys: {self.active_connections.keys()}")
+        print(f"[{settings.SERVER_ID}] User {user_id} connected locally.")
 
     def disconnect(self, user_id: int):
         safe_id = int(user_id)
@@ -111,3 +111,10 @@ async def websocket_endpoint(
             
     except WebSocketDisconnect:
         manager.disconnect(user_id)
+
+
+"""
+Now if bob is offline and misses the redis event when alice send the message 
+message is saved on postgres 
+when bob is online and connected to the websocket, he will receive the message from redis
+"""
