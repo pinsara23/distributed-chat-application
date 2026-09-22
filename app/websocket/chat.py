@@ -8,6 +8,7 @@ from app.core.database import get_db
 from app.core.config import settings
 from app.schemas.auth import TokenPayload
 from app.services.chat_service import ChatService
+from app.messaging.redis_client import redis_manager
 
 router = APIRouter()
 
@@ -96,13 +97,17 @@ async def websocket_endpoint(
             }
             #print(f"DEBUG: Outbound msg prepared. Active connections: {manager.active_connections.keys()}")
             
-            # 6. Push to target (Bob) if online, and echo back to sender (Alice)
-            #print(f"DEBUG: Attempting to send to Bob (Target ID: {target_id})...")
-            await manager.send_personal_message(json.dumps(outbound_msg), target_id)
+            # # 6. Push to target (Bob) if online, and echo back to sender (Alice)
+            # #print(f"DEBUG: Attempting to send to Bob (Target ID: {target_id})...")
+            # await manager.send_personal_message(json.dumps(outbound_msg), target_id)
             
-            #print(f"DEBUG: Attempting to echo to Alice (Sender ID: {user_id})...")
-            await manager.send_personal_message(json.dumps(outbound_msg), user_id)
-            #print(f"DEBUG: Cycle complete! Waiting for next message...\n")
+            # #print(f"DEBUG: Attempting to echo to Alice (Sender ID: {user_id})...")
+            # await manager.send_personal_message(json.dumps(outbound_msg), user_id)
+            # #print(f"DEBUG: Cycle complete! Waiting for next message...\n")
+
+            # 6. Hand the payload to redis insted of local delivery
+            await redis_manager.publish_message(target_id, outbound_msg)
+            await redis_manager.publish_message(user_id, outbound_msg)  # Echo back to sender
             
     except WebSocketDisconnect:
         manager.disconnect(user_id)
