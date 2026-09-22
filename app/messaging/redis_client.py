@@ -34,6 +34,13 @@ class RedisPublisherManager:
             await self.redis_client.close()
 
 
+    async def publish_message(self, target_user_id: int, message_payload: dict):
+        """Publishes a message payload to a specific user's Redis channel."""
+        channel = f"chat:user{target_user_id}"
+        await self.redis_client.publish(channel, json.dumps(message_payload))
+        print(f"[{settings.SERVER_ID}] Published event to {channel}") 
+
+
     async def subscribe_and_listen(self, target_user_id: int, message_payload: dict):
         """Publishes a message payload to a specific user's Redis channel."""
 
