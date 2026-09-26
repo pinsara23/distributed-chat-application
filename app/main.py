@@ -7,21 +7,19 @@ from app.messaging.redis_client import redis_manager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # connect to redis
+    # 1. Connect to Redis
     await redis_manager.connect()
-
-    # star the background listner task
-    # pass chat.manager to redis client
-    listner_task = asyncio.create_task(
+    
+    # 2. START THE LISTENER IN THE BACKGROUND
+    listener_task = asyncio.create_task(
         redis_manager.subscribe_and_listen(chat.manager)
     )
-
-    yield  # This is where the application runs
-
-    #clean up the resources
-    listner_task.cancel()
+    
+    yield  
+    
+    # 3. Cleanup
+    listener_task.cancel()
     await redis_manager.disconnect()
-
 
 app = FastAPI(
     title="Distributed Chat API (Stage 2)",

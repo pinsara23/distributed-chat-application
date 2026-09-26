@@ -16,3 +16,26 @@ Ensure your .env is configured, then run:
 
 Bash
 pytest -v
+
+
+activate servers
+ first activate redis server on wsl 
+ sudo service redis-server start
+
+then check it using redis-cli ping
+
+then activate 3 servers in 3 terminals
+set SERVER_ID=chat-server-1
+uvicorn app.main:app --port 8001
+
+set SERVER_ID=chat-server-2
+uvicorn app.main:app --port 8002
+
+set SERVER_ID=chat-server-3
+uvicorn app.main:app --port 8003
+
+start ngnix - it is in D:\Softwares\nginx-1.30.5\nginx-1.30.5 my pc (YOu can add anywhere in your pc)
+inside this have ngnix.exe file, double click on it to start the server. It will start on port 8000. 
+
+to cose it later when you are done working, 
+open a normal Windows command prompt in the Nginx folder and type (nginx -s quit.)

@@ -27,6 +27,7 @@ class ConnectionManager:
         safe_id = int(user_id)
         if safe_id in self.active_connections:
             del self.active_connections[safe_id]
+            print(f"[{settings.SERVER_ID}] User {safe_id} disconnected.")
 
     async def send_personal_message(self, message: str, target_user_id: int):
         safe_target = int(target_user_id)
@@ -35,7 +36,7 @@ class ConnectionManager:
         if safe_target in self.active_connections:
             websocket = self.active_connections[safe_target]
             await websocket.send_text(message)
-            #print(f"DEBUG MANAGER: -> Successfully fired send_text() to user {safe_target}")
+            print(f"[{settings.SERVER_ID}] Delivered message to local User {safe_target}.")
         else:
             print(f"DEBUG MANAGER: -> FAILED! User {safe_target} not found in dictionary!")
 

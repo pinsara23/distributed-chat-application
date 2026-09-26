@@ -14,60 +14,58 @@ import asyncio
 import redis.asyncio as redis
 from app.core.config import settings
 
-class RedisPublisherManager:
+class RedisPubSubManager:
     def __init__(self):
         self.redis_client = None
-        self.pubsun = None
+        self.pubsub = None  # This must exist!
 
     async def connect(self):
-
-        # decode_responses=True      ensures we get strings back from Redis, not raw bytes
+        # 1. Connect to the main Redis client
         self.redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
-        self.pubsun = self.redis_client.pubsub()
+        # 2. Initialize the pubsub attribute (THIS IS WHAT CRASHED YOUR APP)
+        self.pubsub = self.redis_client.pubsub()
         print(f"[{settings.SERVER_ID}] connected to redis.")
 
-
     async def disconnect(self):
-        if self.pubsun:
-            await self.pubsun.close()
-        if  self.redis_client:
+        if self.pubsub:
+            await self.pubsub.close()
+        if self.redis_client:
             await self.redis_client.close()
-
 
     async def publish_message(self, target_user_id: int, message_payload: dict):
         """Publishes a message payload to a specific user's Redis channel."""
-
-        channel = f"chat:user{target_user_id}"
+        channel = f"chat:user:{target_user_id}"
         await self.redis_client.publish(channel, json.dumps(message_payload))
         print(f"[{settings.SERVER_ID}] Published event to {channel}")
 
-
     async def subscribe_and_listen(self, local_websocket_manager):
         """Listens for cross-server messages and attempts local delivery."""
-        # Listen to all channels that match the pattern "chat:user*"
-
-        await self.pubsun.psubscribe("chat:user*")
-        print(f"[{settings.SERVER_ID}] Subscribed to cross-server chat channels.")
-
         try:
-            # continuously wait for new messages pushed by Redis
-            async for message in self.pubsun.listen():
+            print(f"[{settings.SERVER_ID}] Attempting to start Redis listener...")
+            
+            await self.pubsub.psubscribe("chat:user:*")
+            print(f"[{settings.SERVER_ID}] Subscribed to cross-server chat channels.")
+            
+            async for message in self.pubsub.listen():
+                print(f"[{settings.SERVER_ID}] RAW REDIS EVENT: {message}") 
+                
                 if message["type"] == "pmessage":
-                    channel = message["channel"]
-                    data = json.loads(message["data"])
-
-                    # Extract target user ID from the channel string (e.g., "chat:user:35" -> 35)
-                    target_user_id = int(channel.split(":")[-1])
-
-                    # Pass the message to the local WebSocket manager.
-                    # It will silently ignore the message if the user is NOT connected to this specific server instance.
-
-                    await local_websocket_manager.send_personal_message(json.dumps(data), target_user_id) # implemet in future
-
+                    try:
+                        channel = message["channel"]
+                        data = json.loads(message["data"])
+                        
+                        target_user_id = int(channel.split(":")[-1])
+                        await local_websocket_manager.send_personal_message(json.dumps(data), target_user_id)
+                    except Exception as inner_e:
+                        print(f"[{settings.SERVER_ID}] ERROR PARSING MESSAGE: {inner_e}")
+                        
         except asyncio.CancelledError:
             print(f"[{settings.SERVER_ID}] Redis listener shutting down.")
+        except Exception as fatal_e:
+            print(f"[{settings.SERVER_ID}] FATAL LISTENER CRASH: {fatal_e}")
 
-redis_manager = RedisPublisherManager()
+# Ensure your global instance matches the name used in main.py and chat.py
+redis_manager = RedisPubSubManager()
 
 
 
