@@ -12,3 +12,6 @@ __pycache__/
 # IDEs
 .vscode/
 .idea/
+
+stage3_prompt.txt
+stage4_propmt.txt
