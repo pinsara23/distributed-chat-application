@@ -1,19 +1,20 @@
-# Distributed Encrypted Chat - Stage 1
+# Distributed Encrypted Chat - Stage 2 (Multi-Server)
 
 ## Overview
-This is Stage 1 of a 4-stage distributed chat architecture. Currently, it operates as a secure, single-server real-time chat backend. It features robust JWT authentication, asynchronous PostgreSQL persistence, and real-time bi-directional messaging via WebSockets.
+Stage 2 evolves the chat backend from a single instance into a horizontally scaled, distributed system. Multiple FastAPI instances run concurrently behind an Nginx load balancer. 
+
+Because active WebSockets are stateful and live in local server memory, **Redis Pub/Sub** acts as the high-speed communication bus. It instantly routes real-time events between servers so that a sender on Server 1 can seamlessly chat with a recipient on Server 3.
 
 ## Architecture
-- **API Framework:** FastAPI (Python 3.11+)
-- **Database:** PostgreSQL (accessed asynchronously via `asyncpg`)
-- **ORM:** SQLAlchemy 2.0 with strict Pydantic schema validation
-- **Real-Time:** In-memory WebSocket connection manager (Single-server design)
-- **Security:** Argon2id password hashing, JWT-based REST and WebSocket authentication
+- **Load Balancer:** Nginx (Round-robin traffic distribution)
+- **API Framework:** 3x FastAPI (Python 3.11+) Nodes
+- **Real-Time Communication:** Redis Pub/Sub (`redis.asyncio`)
+- **Persistent Storage:** PostgreSQL (Shared Database)
+- **Design Pattern:** "Persist Before Publish" — messages are durably stored in PostgreSQL before being published to the transient Redis real-time layer.
 
-## Local Setup (Development)
-1. **Database:** Ensure a local PostgreSQL instance is running with a database created (e.g., `chat_db`).
-2. **Environment:** Copy `.env.example` to `.env` and fill in your database credentials and a secure `JWT_SECRET_KEY`.
-3. **Dependencies:** 
+## How to Run (Docker)
+1. Ensure Docker Desktop is running.
+2. Copy `.env.example` to `.env`.
+3. Spin up the entire infrastructure:
    ```bash
-   conda env create -f environment.yml
-   conda activate chat-stage1
+   docker compose up --build -d
