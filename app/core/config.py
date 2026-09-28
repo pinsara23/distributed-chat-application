@@ -9,6 +9,7 @@ class Settings(BaseSettings):
 
     SERVER_ID: str = "chat-server-local"
     REDIS_URL: str = "redis://localhost:6379/0"
+    RABBITMQ_URL: str = "amqp://admin:admin@localhost/"
 
     # Database
     POSTGRES_USER: str
