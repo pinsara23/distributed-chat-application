@@ -39,3 +39,32 @@ inside this have ngnix.exe file, double click on it to start the server. It will
 
 to cose it later when you are done working, 
 open a normal Windows command prompt in the Nginx folder and type (nginx -s quit.)
+
+
+install rabitmq
+
+sudo apt update
+sudo apt install rabbitmq-server
+# Enable the RabbitMQ Management UI (Crucial for learning!)
+sudo rabbitmq-plugins enable rabbitmq_management
+# Start the server
+sudo service rabbitmq-server start
+
+sometimes when using wsl2 rabbitmq doesnt work for guest userd then use this configs change user as admin
+
+The Fix (Run in your WSL Terminal):
+1. Create a new admin user (username: admin, password: admin)
+
+Bash
+sudo rabbitmqctl add_user admin admin
+sudo rabbitmqctl set_user_tags admin administrator
+sudo rabbitmqctl set_permissions -p / admin ".*" ".*" ".*"
+2. Ensure the management plugin is fully active and restart the service
+
+Bash
+sudo rabbitmq-plugins enable rabbitmq_management
+sudo service rabbitmq-server restart
+
+stop server
+
+sudo service rabbitmq-server stop
