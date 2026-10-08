@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     SERVER_ID: str = "chat-server-local"
     REDIS_URL: str = "redis://localhost:6379/0"
     RABBITMQ_URL: str = "amqp://admin:admin@localhost/"
+    MESSAGE_ENCRYPTION_KEY: str = "dac107799438e1179546c1b21ea5f2d95506142f96233b1d9087162512c76c5d"
 
     # Database
     POSTGRES_USER: str
