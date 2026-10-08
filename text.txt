@@ -68,3 +68,9 @@ sudo service rabbitmq-server restart
 stop server
 
 sudo service rabbitmq-server stop
+
+
+
+generate alambic migration
+
+alembic revision --autogenerate -m "add encryption and uuid to messages"
