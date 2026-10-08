@@ -11,7 +11,7 @@ class Message(Base):
 
    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
-   message_uuid = Mapped[uuid.UUID] = mapped_column(
+   message_uuid: Mapped[uuid.UUID] = mapped_column(
       UUID(as_uuid=True), 
       default=uuid.uuid4, 
       unique=True,
