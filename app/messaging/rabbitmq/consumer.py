@@ -22,7 +22,7 @@ async def  on_message(message:aio_pika.abc.AbstractIncomingMessage):
 
         # 2. Process the event
 
-        # do in next step
+        # do in next step 10
 
 
         # 3. Tell Rabbitmq it was successfully processed
