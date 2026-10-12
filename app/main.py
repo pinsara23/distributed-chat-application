@@ -6,6 +6,7 @@ from app.websocket import chat
 from app.messaging.redis_client import redis_manager
 from app.messaging.rabbitmq.connection import rabbitmq_manager
 from app.messaging.rabbitmq.publisher import process_outbox
+from app.messaging.rabbitmq.consumer import start_consumer
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -19,6 +20,8 @@ async def lifespan(app: FastAPI):
     # 2. RabbitMQ
     await rabbitmq_manager.connect()
     await rabbitmq_manager.setup_topology()
+
+    await start_consumer()  # Start the RabbitMQ consumer to listen for messages
 
     # 3. Outbox publisher
     outbox_task = asyncio.create_task(process_outbox())
