@@ -5,24 +5,29 @@ from app.api import auth, conversations
 from app.websocket import chat  
 from app.messaging.redis_client import redis_manager
 from app.messaging.rabbitmq.connection import rabbitmq_manager
+from app.messaging.rabbitmq.publisher import process_outbox
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Connect to Redis
+    # 1. Redis
     await redis_manager.connect()
     
-    # 2. START THE LISTENER IN THE BACKGROUND
-    listener_task = asyncio.create_task(
+    redis_listener_task = asyncio.create_task(
         redis_manager.subscribe_and_listen(chat.manager)
     )
 
+    # 2. RabbitMQ
     await rabbitmq_manager.connect()
     await rabbitmq_manager.setup_topology()
+
+    # 3. Outbox publisher
+    outbox_task = asyncio.create_task(process_outbox())
     
     yield  
     
-    # 3. Cleanup
-    listener_task.cancel()
+    # shutdown
+    redis_listener_task.cancel()
+    outbox_task.cancel()
     await redis_manager.disconnect()
     await rabbitmq_manager.disconnect()
     
