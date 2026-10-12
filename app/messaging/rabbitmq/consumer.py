@@ -35,11 +35,14 @@ async def  on_message(message:aio_pika.abc.AbstractIncomingMessage):
         await message.nack(requeue=False)
 
 
-    async def start_consumer():
-        """ Attach the callback to the RabbitmQ Queue"""
-        print(f"[{settings.SERVER_ID}] Starting RabbitMQ Consumer...")
+async def start_consumer():
+    """ Attach the callback to the RabbitmQ Queue"""
+    print(f"[{settings.SERVER_ID}] Starting RabbitMQ Consumer...")
 
-        if not rabbitmq_manager.channel:
-            raise RuntimeError("RabbitMQ channel is not initialized.")
+    if not rabbitmq_manager.channel:
+        raise RuntimeError("RabbitMQ channel is not initialized.")
 
-        queue = await rabbitmq_manager.channel.get_queue("chat.message.queue")
+    queue = await rabbitmq_manager.channel.get_queue("chat.message.queue")
+
+    # start listening and route incomming msgs to on_message func
+    await queue.consume(on_message)
