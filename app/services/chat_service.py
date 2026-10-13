@@ -6,6 +6,10 @@ from fastapi import HTTPException, status
 from app.models.user import User
 from app.models.conversation import Conversation, ConversationParticipant
 from app.models.message import Message
+from app.models.outbox_events import OutboxEvent
+from app.schemas.event import ChatEventEnevelope, MessageCreatePayload
+from app.core.encryption import encryption_service
+from app.core.config import settings
 
 class ChatService:
     def __init__(self, db: AsyncSession):
@@ -101,33 +105,44 @@ class ChatService:
         return result.scalars().all()
 
 
+    async def save_message(self, conversation_id: int, sender_id: int, target_id: int, content: str) -> Message:
 
-    async def save_message(self, conversation_id: int, sender_id: int, content: str) -> Message:
-        # verify sender 
-        sender = await self.db.execute(
-            select(ConversationParticipant)
-            .where(
-                and_(
-                    ConversationParticipant.conversation_id == conversation_id,
-                    ConversationParticipant.user_id == sender_id
-                )
-            )
+        cipher, nonce, version = encryption_service.encrypt(content)
+
+        new_message = Message(
+            conversation_id=conversation_id,
+            sender_id=sender_id,
+            cipertext=cipher,
+            nonce=nonce,
+            version=version
         )
 
-        if not sender.scalars().first():
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not authorized to send messages in this conversation.",
-            )
-
-        # create persist the message
-        new_message  = Message(
-            conversation_id = conversation_id,
-            sender_id = sender_id,
-            content = content
-        )
         self.db.add(new_message)
+
+        await self.db.flush()  # Flush to get the new message ID
+        
+        payload = MessageCreatePayload(
+            message_id=new_message.message_uuid,
+            conversation_id=new_message.conversation_id,
+            sender_id=new_message.sender_id,
+            target_user_id=target_id
+        )
+
+        enevelope = ChatEventEnevelope(
+            event_type="message.created",
+            producer=settings.SERVER_ID,
+            payload=payload
+        )
+
+        outbox_event = OutboxEvent(
+            event_id=enevelope.event_id,
+            event_type=enevelope.event_type,
+            payload=enevelope.model_dump(mode="json")
+        )
+
+        self.db.add(outbox_event)
+
         await self.db.commit()
         await self.db.refresh(new_message)
-
+        
         return new_message
