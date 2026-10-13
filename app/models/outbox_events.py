@@ -40,4 +40,4 @@ class OutboxEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
 # when it was successfully published to RabbitMQ (None - not yet published)
-    publised_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

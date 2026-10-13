@@ -74,3 +74,12 @@ sudo service rabbitmq-server stop
 generate alambic migration
 
 alembic revision --autogenerate -m "add encryption and uuid to messages"
+
+
+websocket message sending pattern 
+
+{
+  "conversation_id": 1,
+  "target_user_id": 2,
+  "content": "Hello Bob! This is an encrypted RabbitMQ message!"
+}

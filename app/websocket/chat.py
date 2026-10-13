@@ -71,19 +71,31 @@ async def websocket_endpoint(
     
     try:
         while True:
-            # 3. Wait for JSON messages from this user
+            # 3. Wait for messages from this user
             data = await websocket.receive_text()
-            payload = json.loads(data)
             
+            # --- NEW: Safely parse the JSON ---
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                print(f"[{settings.SERVER_ID}] Invalid JSON received: {data}")
+                await websocket.send_text(json.dumps({"error": "Message must be valid JSON."}))
+                continue # Skip the rest of the loop and wait for the next message
+            
+            # Make sure all required fields are present
+            if "conversation_id" not in payload or "target_user_id" not in payload or "content" not in payload:
+                await websocket.send_text(json.dumps({"error": "Missing required fields."}))
+                continue
+                
             conv_id = int(payload.get("conversation_id"))
             target_id = int(payload.get("target_user_id"))
             content = payload.get("content")
             
-            # 4. Save to PostgreSQL AND Outbox (The new Transactional method!)
+            # 4. Save to PostgreSQL AND Outbox
             saved_msg = await chat_service.save_message(
                 conversation_id=conv_id,
                 sender_id=user_id,
-                target_id=target_id,  # Passed to the service now
+                target_id=target_id, 
                 content=content
             )
             
@@ -93,13 +105,11 @@ async def websocket_endpoint(
                 "message_uuid": str(saved_msg.message_uuid),
                 "conversation_id": conv_id,
                 "sender_id": user_id,
-                "content": content, # Plaintext echo for the sender
+                "content": content,
                 "created_at": saved_msg.created_at.isoformat()
             }
             
             # 6. Echo back to sender instantly via Redis
-            # We DO NOT publish to target_id here. The background Outbox Worker 
-            # and RabbitMQ Consumer will handle fetching and delivering it to Bob!
             await redis_manager.publish_message(user_id, outbound_msg)
             
     except WebSocketDisconnect:

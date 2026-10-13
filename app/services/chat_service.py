@@ -114,7 +114,7 @@ class ChatService:
             sender_id=sender_id,
             cipertext=cipher,
             nonce=nonce,
-            version=version
+            encryption_version=version
         )
 
         self.db.add(new_message)
