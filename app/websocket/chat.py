@@ -79,36 +79,28 @@ async def websocket_endpoint(
             target_id = int(payload.get("target_user_id"))
             content = payload.get("content")
             
-            # 4. Save to PostgreSQL
-            #print(f"DEBUG: Saving message from user {user_id} to DB...")
+            # 4. Save to PostgreSQL AND Outbox (The new Transactional method!)
             saved_msg = await chat_service.save_message(
                 conversation_id=conv_id,
                 sender_id=user_id,
+                target_id=target_id,  # Passed to the service now
                 content=content
             )
-            #print(f"DEBUG: Message saved! ID: {saved_msg.id}")
             
-            # 5. Prepare the outgoing message JSON
+            # 5. Prepare the outgoing message JSON for the instant echo
             outbound_msg = {
                 "id": saved_msg.id,
+                "message_uuid": str(saved_msg.message_uuid),
                 "conversation_id": conv_id,
                 "sender_id": user_id,
-                "content": content,
+                "content": content, # Plaintext echo for the sender
                 "created_at": saved_msg.created_at.isoformat()
             }
-            #print(f"DEBUG: Outbound msg prepared. Active connections: {manager.active_connections.keys()}")
             
-            # # 6. Push to target (Bob) if online, and echo back to sender (Alice)
-            # #print(f"DEBUG: Attempting to send to Bob (Target ID: {target_id})...")
-            # await manager.send_personal_message(json.dumps(outbound_msg), target_id)
-            
-            # #print(f"DEBUG: Attempting to echo to Alice (Sender ID: {user_id})...")
-            # await manager.send_personal_message(json.dumps(outbound_msg), user_id)
-            # #print(f"DEBUG: Cycle complete! Waiting for next message...\n")
-
-            # 6. Hand the payload to redis insted of local delivery
-            await redis_manager.publish_message(target_id, outbound_msg)
-            await redis_manager.publish_message(user_id, outbound_msg)  # Echo back to sender
+            # 6. Echo back to sender instantly via Redis
+            # We DO NOT publish to target_id here. The background Outbox Worker 
+            # and RabbitMQ Consumer will handle fetching and delivering it to Bob!
+            await redis_manager.publish_message(user_id, outbound_msg)
             
     except WebSocketDisconnect:
         manager.disconnect(user_id)
