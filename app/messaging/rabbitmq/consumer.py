@@ -8,6 +8,11 @@ import json
 import aio_pika
 from app.messaging.rabbitmq.connection import rabbitmq_manager
 from app.core.config import settings
+from sqlalchemy import select
+from app.core.database import AsyncSessionLocal
+from app.models.message import Message
+from app.core.encryption import encryption_service
+from app.messaging.redis_client import redis_manager
 
 async def  on_message(message:aio_pika.abc.AbstractIncomingMessage):
     # Callback function when fires new message arrives to the queue
@@ -16,13 +21,38 @@ async def  on_message(message:aio_pika.abc.AbstractIncomingMessage):
         # 1. Parse the JSON enevlop
         enevlope = json.loads(message.body.decode('utf-8'))
         event_type= enevlope.get("event_type")
-        event_id = enevlope.get("event_id")
+        payload = enevlope.get("payload",{})
 
-        print(f"[{settings.SERVER_ID}] Consumer received '{event_type}' (ID: {event_id})")
-
+        print(f"[{settings.SERVER_ID}] Consumer processing '{event_type}'...")
+        
         # 2. Process the event
 
-        # do in next step 10
+        if event_type == "message.created":
+            # 1. extract the data from payload
+            message_uuid = payload.get("message_id")
+            target_user_id = payload.get("target_user_id")
+
+            # 2. fetch the encrypted message from the database
+            async with AsyncSessionLocal() as session:
+                stmt = select(Message).where(Message.message_uuid == message_uuid)
+                result = await session.execute(stmt)
+                db_message = result.scalar_one_or_none()
+
+                if db_message:
+                    plaintext = encryption_service.decrypt(db_message.cipertext, db_message.nonce)
+
+                    ws_payload = {
+                        "id": db_message.id,
+                        "message_uuid": str(db_message.message_uuid),
+                        "conversation_id": db_message.conversation_id,
+                        "sender_id": db_message.sender_id,
+                        "content": plaintext,
+                        "created_at": db_message.created_at.isoformat()
+                    }
+
+                    # hends off to redis
+                    await redis_manager.publish_message(target_user_id, ws_payload)
+                    print(f"[{settings.SERVER_ID}] Pushed to Redis for User {target_user_id}")
 
 
         # 3. Tell Rabbitmq it was successfully processed
