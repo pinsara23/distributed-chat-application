@@ -21,7 +21,16 @@ async def  on_message(message:aio_pika.abc.AbstractIncomingMessage):
         # 1. Parse the JSON enevlop
         enevlope = json.loads(message.body.decode('utf-8'))
         event_type= enevlope.get("event_type")
+        event_id = enevlope.get("event_id")
         payload = enevlope.get("payload",{})
+
+        idempotency_key = f"processed_event:{event_id}" # check if this event was already processed by this consumer within last 24 hours
+
+        already_processed = await redis_manager.redis.exists(idempotency_key)
+        if already_processed:
+            print(f"[{settings.SERVER_ID}] Duplicate event {event_id} safely ignored.")
+            await message.ack()  # Acknowledge the message to RabbitMQ
+            return
 
         print(f"[{settings.SERVER_ID}] Consumer processing '{event_type}'...")
         
@@ -54,6 +63,8 @@ async def  on_message(message:aio_pika.abc.AbstractIncomingMessage):
                     await redis_manager.publish_message(target_user_id, ws_payload)
                     print(f"[{settings.SERVER_ID}] Pushed to Redis for User {target_user_id}")
 
+
+        await redis_manager.redis.set(idempotency_key, "1", ex=86400)  # Set key with 24-hour expiration
 
         # 3. Tell Rabbitmq it was successfully processed
         await message.ack()
