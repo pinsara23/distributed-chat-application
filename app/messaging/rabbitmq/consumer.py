@@ -6,6 +6,7 @@ for websocket delivery
 
 import json
 import aio_pika
+import asyncio
 from app.messaging.rabbitmq.connection import rabbitmq_manager
 from app.core.config import settings
 from sqlalchemy import select
@@ -70,10 +71,37 @@ async def  on_message(message:aio_pika.abc.AbstractIncomingMessage):
         await message.ack()
 
     except Exception as e:
+        
         print(f"[{settings.SERVER_ID}] Consumer error: {e}")
         # If it crashed, tell RabbitMQ we failed (NACK)
 
-        await message.nack(requeue=False)
+        # We need the event_id to track retries. If JSON parsing failed entirely, 
+        # we can't extract an ID, so we must dead-letter it immediately.
+
+        try:
+            enevlope = json.loads(message.body.decode('utf-8'))
+            event_id = enevlope.get("event_id")
+        except json.JSONDecodeError:
+            print(f"[{settings.SERVER_ID}] Fatal: Malformed JSON. Routing to DLQ.")
+            await message.nack(requeue=False)
+            return
+
+        retry_key = f"retry_count:{event_id}"
+        attempts = await redis_manager.redis.incr(retry_key)
+
+        if attempts <= 3:
+            print(f"[{settings.SERVER_ID}] Transient failure. Requeueing event {event_id} (Attempt {attempts}/3)")
+            # set 24h experiation for retry count key
+            if attempts == 1:
+                await redis_manager.redis.expire(retry_key, 86400)
+
+                await asyncio.sleep(1)  # Optional: small delay before requeueing
+                await message.nack(requeue=True)  # Requeue the message for retry
+        else:
+            print(f"[{settings.SERVER_ID}] Event {event_id} failed {attempts} times. Routing to DLQ.")
+            await message.nack(requeue=False) # trigger dlx
+
+        
 
 
 async def start_consumer():

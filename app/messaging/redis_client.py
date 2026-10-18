@@ -22,6 +22,8 @@ class RedisPubSubManager:
     async def connect(self):
         # 1. Connect to the main Redis client
         self.redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+        self.redis = self.redis_client  # Expose the Redis client for other modules to use
+
         # 2. Initialize the pubsub attribute (THIS IS WHAT CRASHED YOUR APP)
         self.pubsub = self.redis_client.pubsub()
         print(f"[{settings.SERVER_ID}] connected to redis.")

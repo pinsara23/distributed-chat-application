@@ -18,8 +18,23 @@ class RabbitMqConnectionManager:
     async def setup_topology(self):
         """Declare the exchange, Queues and bindings"""
         if not self.channel:
-            raise Exception("Csannot setup topology before connecting")
+            raise Exception("Cannot setup topology before connecting")
 
+        # dead letter exchange for unprocessed messages
+        dlx = await self.channel.declare_exchange(
+           name="chat.dlx",
+           type=aio_pika.ExchangeType.DIRECT,
+           durable=True
+        )
+        dlq = await self.channel.declare_queue(
+           name="chat.msg.dlq",
+           durable=True,
+        )
+
+        await dlq.bind(
+            exchange=dlx,
+            routing_key="message.created"
+        )
         # 1. declare the exchage
         self.exchange = await self.channel.declare_exchange(
             name="chat.events",
@@ -30,7 +45,10 @@ class RabbitMqConnectionManager:
         # 2. declare the main queuue
         queue = await self.channel.declare_queue(
             name="chat.message.queue",
-            durable = True
+            durable = True,
+            arguments={
+                "x-dead-letter-exchange": "chat.dlx"  # specify the dead letter exchange for unprocessed messages
+            }
         )
 
         # 3.Bind them together with routing key
@@ -39,8 +57,8 @@ class RabbitMqConnectionManager:
             routing_key="message.*"
         )
 
-        print(f"[{settings.SERVER_ID}] RabbitMQ topology setup complete.")
-
+        print(f"[{settings.SERVER_ID}] RabbitMQ topology setup complete (DLQ active).")
+    
     async def disconnect(self):
        """Colse the channels and connections"""
        if self.channel and not self.channel.is_closed:
