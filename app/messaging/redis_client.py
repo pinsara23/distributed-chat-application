@@ -30,9 +30,9 @@ class RedisPubSubManager:
 
     async def disconnect(self):
         if self.pubsub:
-            await self.pubsub.close()
+            await self.pubsub.aclose()
         if self.redis_client:
-            await self.redis_client.close()
+            await self.redis_client.aclose()
 
     async def publish_message(self, target_user_id: int, message_payload: dict):
         """Publishes a message payload to a specific user's Redis channel."""

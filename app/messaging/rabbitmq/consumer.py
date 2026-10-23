@@ -34,7 +34,7 @@ async def  on_message(message:aio_pika.abc.AbstractIncomingMessage):
             return
 
         print(f"[{settings.SERVER_ID}] Consumer processing '{event_type}'...")
-        
+ 
         # 2. Process the event
 
         if event_type == "message.created":
@@ -71,7 +71,7 @@ async def  on_message(message:aio_pika.abc.AbstractIncomingMessage):
         await message.ack()
 
     except Exception as e:
-        
+
         print(f"[{settings.SERVER_ID}] Consumer error: {e}")
         # If it crashed, tell RabbitMQ we failed (NACK)
 

@@ -83,3 +83,20 @@ websocket message sending pattern
   "target_user_id": 2,
   "content": "Hello Bob! This is an encrypted RabbitMQ message!"
 }
+
+1. The Distributed-Systems Problem (Poison Messages)
+
+Currently, if our consumer crashes while processing a message 
+(e.g., Redis is temporarily down), 
+it hits the except Exception block and triggers await message.nack(requeue=False). 
+That deletes the message forever.
+
+If we change it to requeue=True, RabbitMQ will instantly shove it back to the front of the queue, 
+the consumer will instantly crash again, and you create an infinite "Poison Message" 
+loop that spikes your CPU to 100%.
+
+2. The Solution
+Dead Letter Exchange (DLX): We configure our main RabbitMQ queue so that when a message is explicitly rejected (requeue=False), 
+it isn't deleted. Instead, RabbitMQ routes it to a special "quarantine" queue (the DLQ) for debugging.
+
+Bounded Retries: We use Redis to count how many times an event_id has failed. If it fails 1, 2, or 3 times, we requeue=True. On the 4th failure, we requeue=False, letting RabbitMQ sweep it safely into the DLQ.
