@@ -6,7 +6,7 @@ from app.core.config import settings
 PRESENCE__TTL = 30  # seconds
 
 class PresenceService:
-    async def mark_presence(self, user_id: int):
+    async def mark_online(self, user_id: int):
         """Mark user is online with TTL"""
         if not redis_manager.redis:
             return
