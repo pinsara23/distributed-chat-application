@@ -7,6 +7,7 @@ from app.messaging.redis_client import redis_manager
 from app.messaging.rabbitmq.connection import rabbitmq_manager
 from app.messaging.rabbitmq.publisher import process_outbox
 from app.messaging.rabbitmq.consumer import start_consumer
+from app.api import presence
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -44,6 +45,7 @@ app = FastAPI(
 app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
 app.include_router(conversations.router, prefix="/conversations", tags=["Conversations"]) 
 app.include_router(chat.router)
+app.include_router(presence.router, prefix="/users", tags=["Presence"])
 
 @app.get("/")
 async def root():

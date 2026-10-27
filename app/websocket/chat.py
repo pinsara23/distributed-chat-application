@@ -10,6 +10,9 @@ from app.schemas.auth import TokenPayload
 from app.services.chat_service import ChatService
 from app.messaging.redis_client import redis_manager
 
+# --- STAGE 4: Import the Presence Service ---
+from app.presence.service import presence_service
+
 router = APIRouter()
 
 # --- Connection Manager ---
@@ -22,17 +25,24 @@ class ConnectionManager:
         # Strictly cast to int
         self.active_connections[int(user_id)] = websocket
         print(f"[{settings.SERVER_ID}] User {user_id} connected locally.")
+        
+        # --- STAGE 4: Mark Presence Online ---
+        await presence_service.mark_online(user_id)
+        # -------------------------------------
 
-    def disconnect(self, user_id: int):
+    async def disconnect(self, user_id: int):
         safe_id = int(user_id)
         if safe_id in self.active_connections:
             del self.active_connections[safe_id]
             print(f"[{settings.SERVER_ID}] User {safe_id} disconnected.")
+            
+            # --- STAGE 4: Mark Presence Offline ---
+            await presence_service.mark_offline(safe_id)
+            # --------------------------------------
 
     async def send_personal_message(self, message: str, target_user_id: int):
         safe_target = int(target_user_id)
         
-        # Check if the integer key exists in the dictionary
         if safe_target in self.active_connections:
             websocket = self.active_connections[safe_target]
             await websocket.send_text(message)
@@ -51,18 +61,17 @@ async def get_ws_user_id(token: str) -> int | None:
     except (jwt.PyJWTError, ValidationError, ValueError):
         return None
 
-
 # WebSocket endpoint for chat
 @router.websocket("/ws/chat")
 async def websocket_endpoint(
     websocket: WebSocket,
-    token: str = Query(...), # WebSockets in browsers can't easily send headers, so we use a query param
+    token: str = Query(...), 
     db: AsyncSession = Depends(get_db)
 ):
     # 1. Authenticate the WebSocket connection
     user_id = await get_ws_user_id(token)
     if not user_id:
-        await websocket.close(code=1008) # 1008 = Policy Violation (Unauthorized)
+        await websocket.close(code=1008) 
         return
     
     # 2. Accept connection
@@ -74,15 +83,13 @@ async def websocket_endpoint(
             # 3. Wait for messages from this user
             data = await websocket.receive_text()
             
-            # --- NEW: Safely parse the JSON ---
             try:
                 payload = json.loads(data)
             except json.JSONDecodeError:
                 print(f"[{settings.SERVER_ID}] Invalid JSON received: {data}")
                 await websocket.send_text(json.dumps({"error": "Message must be valid JSON."}))
-                continue # Skip the rest of the loop and wait for the next message
+                continue 
             
-            # Make sure all required fields are present
             if "conversation_id" not in payload or "target_user_id" not in payload or "content" not in payload:
                 await websocket.send_text(json.dumps({"error": "Missing required fields."}))
                 continue
@@ -113,11 +120,5 @@ async def websocket_endpoint(
             await redis_manager.publish_message(user_id, outbound_msg)
             
     except WebSocketDisconnect:
-        manager.disconnect(user_id)
-
-
-"""
-Now if bob is offline and misses the redis event when alice send the message 
-message is saved on postgres 
-when bob is online and connected to the websocket, he will receive the message from redis
-"""
+        # --- STAGE 4: Added await here ---
+        await manager.disconnect(user_id)
