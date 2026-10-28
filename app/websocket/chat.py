@@ -89,15 +89,18 @@ async def websocket_endpoint(
                 print(f"[{settings.SERVER_ID}] Invalid JSON received: {data}")
                 await websocket.send_text(json.dumps({"error": "Message must be valid JSON."}))
                 continue 
-
-            # intercept heartbeat send keep laive msg every 10 seconds to refresh the presence status
+            
+            # --- STAGE 4: INTERCEPT HEARTBEATS ---
             if payload.get("type") == "ping":
-                await presence_service.referesh_presence(user_id)
-
-                # send pong back to the client
+                # Refresh the Redis TTL clock!
+                await presence_service.refresh_presence(user_id) # keep user alive by sending keep alive to redis
+                
+                # Send a pong back to the client so it knows the server is alive
                 await websocket.send_text(json.dumps({"type": "pong"}))
                 continue
-
+            # -------------------------------------
+            
+            # --- NORMAL CHAT MESSAGE VALIDATION ---
             if "conversation_id" not in payload or "target_user_id" not in payload or "content" not in payload:
                 await websocket.send_text(json.dumps({"error": "Missing required fields."}))
                 continue
@@ -114,7 +117,7 @@ async def websocket_endpoint(
                 content=content
             )
             
-            # 5. Prepare the outgoing message JSON for the instant echo
+            # 5. Prepare the outgoing message JSON
             outbound_msg = {
                 "id": saved_msg.id,
                 "message_uuid": str(saved_msg.message_uuid),
@@ -128,5 +131,4 @@ async def websocket_endpoint(
             await redis_manager.publish_message(user_id, outbound_msg)
             
     except WebSocketDisconnect:
-        # --- STAGE 4: Added await here ---
         await manager.disconnect(user_id)
