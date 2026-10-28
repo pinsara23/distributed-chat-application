@@ -89,7 +89,15 @@ async def websocket_endpoint(
                 print(f"[{settings.SERVER_ID}] Invalid JSON received: {data}")
                 await websocket.send_text(json.dumps({"error": "Message must be valid JSON."}))
                 continue 
-            
+
+            # intercept heartbeat send keep laive msg every 10 seconds to refresh the presence status
+            if payload.get("type") == "ping":
+                await presence_service.referesh_presence(user_id)
+
+                # send pong back to the client
+                await websocket.send_text(json.dumps({"type": "pong"}))
+                continue
+
             if "conversation_id" not in payload or "target_user_id" not in payload or "content" not in payload:
                 await websocket.send_text(json.dumps({"error": "Missing required fields."}))
                 continue

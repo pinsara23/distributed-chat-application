@@ -38,6 +38,14 @@ class PresenceService:
 
         return {"user_id": user_id, "status": "offline"}
 
+    async def referesh_presence(self, user_id: int): # send a heartbeat(keep alive) to redis to keep the user online
+        if redis_manager.redis:
+            return
+
+        key = f"presence:user:{user_id}"
+        await redis_manager.redis.expire(key, PRESENCE__TTL)
+        
+
 presence_service = PresenceService()
 
         
