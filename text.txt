@@ -100,3 +100,8 @@ Dead Letter Exchange (DLX): We configure our main RabbitMQ queue so that when a 
 it isn't deleted. Instead, RabbitMQ routes it to a special "quarantine" queue (the DLQ) for debugging.
 
 Bounded Retries: We use Redis to count how many times an event_id has failed. If it fails 1, 2, or 3 times, we requeue=True. On the 4th failure, we requeue=False, letting RabbitMQ sweep it safely into the DLQ.
+
+
+When a server crashes and comes back online, if 10,000 disconnected clients all try to 
+reconnect at the exact same millisecond, they will accidentally trigger a 
+Distributed Denial of Service (DDoS) attack on their own server (known as the "Thundering Herd" problem).
