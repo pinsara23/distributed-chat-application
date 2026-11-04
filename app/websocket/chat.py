@@ -3,6 +3,7 @@ import jwt
 from pydantic import ValidationError
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
+import asyncio
 
 from app.core.database import get_db
 from app.core.config import settings
@@ -81,10 +82,19 @@ async def websocket_endpoint(
     try:
         while True:
             # 3. Wait for messages from this user
-            data = await websocket.receive_text()
             
             try:
+
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=45.0) # if we dont here anything for 45s it raise a error
+
+            except asyncio.TimeoutError:
+                print(f"[{settings.SERVER_ID}] User {user_id} timed out (Ghost Connection). Forcing disconnect.")
+                break  # Exit the loop to disconnect the user
+            
+            try:
+
                 payload = json.loads(data)
+            
             except json.JSONDecodeError:
                 print(f"[{settings.SERVER_ID}] Invalid JSON received: {data}")
                 await websocket.send_text(json.dumps({"error": "Message must be valid JSON."}))
@@ -131,4 +141,8 @@ async def websocket_endpoint(
             await redis_manager.publish_message(user_id, outbound_msg)
             
     except WebSocketDisconnect:
+        print(f"[{settings.SERVER_ID}] User {user_id} disconnected normally.")
+
+    finally:
+        # finally gurantees this perform a clean exit even if the user disconnects unexpectedly or an error occurs
         await manager.disconnect(user_id)
