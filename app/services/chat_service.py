@@ -104,6 +104,17 @@ class ChatService:
         result = await self.db.execute(query)
         return result.scalars().all()
 
+    # use this for if client got disconnected and want to fetch missed messages because pub/sub is doesnt store anuthing "fire and forget"
+    async def get_missed_messages(self, conversation_id: int, after_id: int):
+        """Fetches all messages in a conversation strictly after the provided message ID."""
+        stmt = (
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .where(Message.id > after_id)
+            .order_by(Message.id.asc())
+        )
+        result = await self.db.execute(stmt)
+        return result.scalars().all()
 
     async def save_message(self, conversation_id: int, sender_id: int, target_id: int, content: str) -> Message:
 

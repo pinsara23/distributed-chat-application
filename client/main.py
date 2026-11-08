@@ -1,92 +1,91 @@
 import asyncio
 import websockets
+import httpx
 import json
 import random
 
-# TODO: Paste the exact JWT token you use for Alice in Postman right here
-TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZXhwIjoxNzkzODIzMTk0fQ.qMvbXiWNY08rpfkmMa9dVHRv5FX1RkJGlawXWmpfoek"
+# TODO: Paste Alice's token here!
+TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIyIiwiZXhwIjoxNzk0MTczNzcwfQ.upFn9oXuTgU0V4irXmSUokvcjXDtr9D52movIsVPa-Y"
 WS_URL = f"ws://127.0.0.1:8001/ws/chat?token={TOKEN}"
+REST_URL = "http://127.0.0.1:8001"
+
+# --- NEW: State Tracking ---
+last_message_id = 0
+conversation_id = 1 # Assuming we are testing conversation 1
+# ---------------------------
 
 async def heartbeat(websocket):
-    """Sends a ping every 10 seconds to keep the connection alive."""
     try:
         while True:
             await asyncio.sleep(10)
-            ping_msg = json.dumps({"type": "ping"})
-            await websocket.send(ping_msg)
-            print("[Client] Sent: ping")
-    except asyncio.CancelledError:
+            await websocket.send(json.dumps({"type": "ping"}))
+    except Exception:
         pass
-    except Exception as e:
-        print(f"[Client] Heartbeat stopped: {e}")
+
+async def sync_missed_messages():
+    """Fetches messages missed while the client was disconnected."""
+    global last_message_id
+    url = f"{REST_URL}/conversations/{conversation_id}/messages?after_id={last_message_id}"
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, headers=headers)
+        if response.status_code == 200:
+            messages = response.json()
+            if messages:
+                print(f"\n[Client] 🔄 Synced {len(messages)} missed messages!")
+                for msg in messages:
+                    print(f"   -> Recovered DB Message: {msg['content']}")
+                    # Update our cursor to the latest fetched message
+                    last_message_id = max(last_message_id, msg["id"])
+                print()
 
 async def listen(websocket):
-    """Listens for incoming messages from the server."""
+    global last_message_id
     try:
         async for message in websocket:
-            print(f"[Client] Received: {message}")
+            data = json.loads(message)
             
-            # If we receive a ping/pong, we don't necessarily need to alert the user
-            # but it proves our connection is alive!
-    except websockets.exceptions.ConnectionClosed as e:
-        print(f"[Client] Connection closed by server: {e}")
-
-"""
-To prevent this, clients use Exponential Backoff with Jitter.
-
-Exponential Backoff: If the first retry fails, wait 1 second. If that fails, wait 2 seconds, then 4, then 8, up to a maximum 
-(like 16 seconds).
-
-Jitter: Add a random fraction of a second (e.g., + 0.34s) to the delay so that no two clients retry at the exact same time.
-
-"""
+            # Hide pongs to keep terminal clean
+            if data.get("type") == "pong":
+                continue 
+                
+            print(f"[Client] Live WebSocket Message: {data.get('content')}")
+            
+            # Update our cursor when a live message arrives!
+            if "id" in data:
+                last_message_id = max(last_message_id, data["id"])
+                
+    except websockets.exceptions.ConnectionClosed:
+        pass
 
 async def connect_with_retry():
-    """Connects to the server and handles automatic reconnection with Backoff + Jitter."""
     base_delay = 1
     max_delay = 16
 
     while True:
         try:
-            print(f"[Client] Attempting to connect to the server...")
+            print("[Client] Attempting to connect to the server...")
             async with websockets.connect(WS_URL) as websocket:
                 print("[Client] Successfully connected! 🟢")
-                
-                # Reset our backoff delay because we successfully connected
                 base_delay = 1
                 
-                # Start the heartbeat in the background
+                # --- NEW: Fetch missed messages immediately upon reconnecting! ---
+                await sync_missed_messages()
+                # ---------------------------------------------------------------
+                
                 heartbeat_task = asyncio.create_task(heartbeat(websocket))
-                
-                # Block here and listen for messages until the socket dies
                 await listen(websocket)
-                
-                # If listen() finishes, the socket died. Cancel the heartbeat.
                 heartbeat_task.cancel()
 
-        except (websockets.exceptions.WebSocketException, ConnectionRefusedError, OSError) as e:
-            print(f"[Client] Connection failed or dropped: {e}")
+        except Exception:
+            pass
         
-        # --- EXPONENTIAL BACKOFF + JITTER ---
-        jitter = random.uniform(0, 0.5) # Add between 0 and 0.5 seconds of randomness
+        jitter = random.uniform(0, 0.5)
         delay = base_delay + jitter
-        print(f"[Client] 🔴 Reconnecting in {delay:.2f} seconds...\n")
-        
+        print(f"[Client] 🔴 Disconnected. Reconnecting in {delay:.2f} seconds...")
         await asyncio.sleep(delay)
-        
-        # Double the delay for the next failure, but cap it at max_delay (16s)
         base_delay = min(base_delay * 2, max_delay)
 
 if __name__ == "__main__":
-    if TOKEN == "PASTE_ALICE_TOKEN_HERE":
-        print("ERROR: Please paste Alice's JWT token into the TOKEN variable in client/main.py!")
-    else:
-        asyncio.run(connect_with_retry())
-
-
-
-"""
-asyncio.create_task(heartbeat(websocket)) spawns a background thread that automatically fires our {"type": "ping"} every 10 seconds. You no longer have to type it manually!
-
-The while True: loop inside connect_with_retry ensures the script never gives up if it gets disconnected. It just catches the error, calculates the exponential delay (base_delay * 2), sleeps, and loops back to try again.
-"""
+    asyncio.run(connect_with_retry())
