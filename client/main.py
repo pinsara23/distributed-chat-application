@@ -5,14 +5,16 @@ import json
 import random
 
 # TODO: Paste Alice's token here!
-TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIyIiwiZXhwIjoxNzk0MTczNzcwfQ.upFn9oXuTgU0V4irXmSUokvcjXDtr9D52movIsVPa-Y"
+TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIyIiwiZXhwIjoxNzk0MTc1MTEyfQ.t8bEO3ZxtqrHMk4YWicmgpoH2eSBGfWHtQ9vqYpZxD4"
 WS_URL = f"ws://127.0.0.1:8001/ws/chat?token={TOKEN}"
 REST_URL = "http://127.0.0.1:8001"
 
-# --- NEW: State Tracking ---
 last_message_id = 0
-conversation_id = 1 # Assuming we are testing conversation 1
-# ---------------------------
+conversation_id = 1 
+
+# --- STAGE 4: Client-Side Deduplication Set ---
+seen_messages = set()
+# ----------------------------------------------
 
 async def heartbeat(websocket):
     try:
@@ -23,8 +25,8 @@ async def heartbeat(websocket):
         pass
 
 async def sync_missed_messages():
-    """Fetches messages missed while the client was disconnected."""
-    global last_message_id
+    """Fetches and deduplicates missed messages."""
+    global last_message_id, seen_messages
     url = f"{REST_URL}/conversations/{conversation_id}/messages?after_id={last_message_id}"
     headers = {"Authorization": f"Bearer {TOKEN}"}
     
@@ -32,29 +34,45 @@ async def sync_missed_messages():
         response = await client.get(url, headers=headers)
         if response.status_code == 200:
             messages = response.json()
-            if messages:
-                print(f"\n[Client] 🔄 Synced {len(messages)} missed messages!")
-                for msg in messages:
+            synced_count = 0
+            
+            for msg in messages:
+                msg_id = msg["id"]
+                
+                # --- DEDUPLICATION CHECK ---
+                if msg_id not in seen_messages:
+                    seen_messages.add(msg_id)
                     print(f"   -> Recovered DB Message: {msg['content']}")
-                    # Update our cursor to the latest fetched message
-                    last_message_id = max(last_message_id, msg["id"])
-                print()
+                    synced_count += 1
+                # ---------------------------
+                
+                # Always update the cursor, even if it was a duplicate
+                last_message_id = max(last_message_id, msg_id)
+                
+            if synced_count > 0:
+                print(f"\n[Client] 🔄 Synced {synced_count} unique missed messages!\n")
 
 async def listen(websocket):
-    global last_message_id
+    """Listens for live messages and drops duplicates."""
+    global last_message_id, seen_messages
     try:
         async for message in websocket:
             data = json.loads(message)
             
-            # Hide pongs to keep terminal clean
             if data.get("type") == "pong":
                 continue 
-                
-            print(f"[Client] Live WebSocket Message: {data.get('content')}")
             
-            # Update our cursor when a live message arrives!
-            if "id" in data:
-                last_message_id = max(last_message_id, data["id"])
+            msg_id = data.get("id")
+            
+            # --- DEDUPLICATION CHECK ---
+            if msg_id and msg_id not in seen_messages:
+                seen_messages.add(msg_id)
+                print(f"[Client] Live WebSocket Message: {data.get('content')}")
+                
+                last_message_id = max(last_message_id, msg_id)
+            elif msg_id:
+                print(f"[Client] 🛡️ Blocked duplicate message ID: {msg_id}")
+            # ---------------------------
                 
     except websockets.exceptions.ConnectionClosed:
         pass
@@ -70,9 +88,7 @@ async def connect_with_retry():
                 print("[Client] Successfully connected! 🟢")
                 base_delay = 1
                 
-                # --- NEW: Fetch missed messages immediately upon reconnecting! ---
                 await sync_missed_messages()
-                # ---------------------------------------------------------------
                 
                 heartbeat_task = asyncio.create_task(heartbeat(websocket))
                 await listen(websocket)
