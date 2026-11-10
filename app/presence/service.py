@@ -17,52 +17,69 @@ class PresenceService:
     
     async def mark_online(self, user_id: int):
         """Mark user is online with TTL"""
-        redis = self._get_redis()
-        if not redis:
-            return
+        try:
+            redis = self._get_redis()
+            if not redis:
+                return
         
-        key = f"presence:user:{user_id}" # indicate this user is presence now
-        data = {
-            "server_id": settings.SERVER_ID,
-            "status": "online"
-        }
+            key = f"presence:user:{user_id}" # indicate this user is presence now
+            data = {
+                "server_id": settings.SERVER_ID,
+                "status": "online"
+            }
 
-        await redis.set(key, json.dumps(data), ex=PRESENCE__TTL)
+            await redis.set(key, json.dumps(data), ex=PRESENCE__TTL)
+        except Exception as e:
+            print(f"[{settings.SERVER_ID}] ⚠️ Redis is down. Skipping mark_online for user {user_id}")
+
 
     async def mark_offline(self, user_id: int):
-        redis = self._get_redis()
-        if not redis:
-            return
+        try:
+            redis = self._get_redis()
+            if not redis:
+                return
 
-        key = f"presence:user:{user_id}"
-        await redis.delete(key)
+            key = f"presence:user:{user_id}"
+            await redis.delete(key)
+        except Exception as e:
+            print(f"[{settings.SERVER_ID}] ⚠️ Redis is down. Skipping mark_offline for user {user_id}")
+
 
     async def get_presence(self, user_id: int) -> dict:
+        try:
+            redis = self._get_redis()
+            if not redis:
+                return {"user_id": user_id, "status": "unknown"}
+            
+            key = f"presence:user:{user_id}"
+            data = await redis.get(key)
 
-        redis = self._get_redis()
-        if not redis:
+            if data:
+                return {"user_id": user_id, "status": "online"}
+
+            return {"user_id": user_id, "status": "offline"}
+        except Exception as e:
+            print(f"[{settings.SERVER_ID}] ⚠️ Redis is down. Cannot fetch presence for user {user_id}")
+            # Safe fallback if Redis is dead
             return {"user_id": user_id, "status": "unknown"}
-        
-        key = f"presence:user:{user_id}"
-        data = await redis.get(key)
 
-        if data:
-            return {"user_id":user_id, "status": "online"}
 
-        return {"user_id": user_id, "status": "offline"}
+    async def refresh_presence(self, user_id: int): 
+        """Send a heartbeat (keep alive) to redis to keep the user online"""
+        try:
+            redis = self._get_redis()
+            if not redis:
+                return
 
-    async def refresh_presence(self, user_id: int): # send a heartbeat(keep alive) to redis to keep the user online
-        redis = self._get_redis()
-        if not redis:
-            return
+            key = f"presence:user:{user_id}"
+            key_exists = await redis.expire(key, PRESENCE__TTL)  # refresh the TTL to keep the user online
 
-        key = f"presence:user:{user_id}"
-        key_exists = await redis.expire(key, PRESENCE__TTL)  # refresh the TTL to keep the user online
-
-        if not key_exists:
-            # If the key doesn't exist, mark the user as online again
-            await self.mark_online(user_id)
+            if not key_exists:
+                # If the key doesn't exist, mark the user as online again
+                await self.mark_online(user_id)
+        except Exception as e:
+            # We silently pass here so the WebSocket doesn't crash. 
+            # The WebSocket stays alive locally, even if global presence is down!
+            pass 
 
 presence_service = PresenceService()
-
-        

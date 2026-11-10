@@ -105,3 +105,10 @@ Bounded Retries: We use Redis to count how many times an event_id has failed. If
 When a server crashes and comes back online, if 10,000 disconnected clients all try to 
 reconnect at the exact same millisecond, they will accidentally trigger a 
 Distributed Denial of Service (DDoS) attack on their own server (known as the "Thundering Herd" problem).
+
+
+2. The Distributed-Systems Concept: Graceful Degradation & Eventual Consistency
+Graceful Degradation: If a non-critical component (like Redis presence) fails, the core system (saving messages) should still work.
+
+Eventual Consistency: If RabbitMQ fails, the message might be delayed, 
+but the Transactional Outbox pattern guarantees it will eventually be delivered once RabbitMQ returns.
