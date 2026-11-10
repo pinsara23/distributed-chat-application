@@ -51,6 +51,26 @@ class ConnectionManager:
         else:
             print(f"DEBUG MANAGER: -> FAILED! User {safe_target} not found in dictionary!")
 
+
+    async def close_all(self):
+        """Cleanly disconnects all active local WebSockets during server shutdown."""
+        # Create a copy of the keys so we don't modify the dictionary while iterating
+        active_users = list(self.active_connections.keys())
+        for user_id in active_users:
+            try:
+                websocket = self.active_connections[user_id]
+                # Send a standard WS close code 1001 (Going Away)
+                await websocket.close(code=1001, reason="Server shutting down")
+                
+                # Update Redis presence to offline before Redis shuts down
+                await presence_service.mark_offline(user_id)
+                print(f"[{settings.SERVER_ID}] Cleanly closed WebSocket for User {user_id} during shutdown.")
+            except Exception as e:
+                print(f"[{settings.SERVER_ID}] Error closing WebSocket for User {user_id}: {e}")
+        
+        # Clear the dictionary
+        self.active_connections.clear()
+        
 manager = ConnectionManager()
 
 # websocket authentication helper

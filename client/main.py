@@ -5,7 +5,7 @@ import json
 import random
 
 # TODO: Paste Alice's token here!
-TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIyIiwiZXhwIjoxNzk0MTc1MTEyfQ.t8bEO3ZxtqrHMk4YWicmgpoH2eSBGfWHtQ9vqYpZxD4"
+TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZXhwIjoxNzk0MzM3NjMzfQ.IXqjV_w2oRNhHBGsgRVgdhfQ96hi7TpVLuKUgV3GdKI"
 WS_URL = f"ws://127.0.0.1:8001/ws/chat?token={TOKEN}"
 REST_URL = "http://127.0.0.1:8001"
 
