@@ -2,12 +2,22 @@ from pydantic import BaseModel
 from datetime import datetime
 from uuid import UUID
 
+class MessageCreate(BaseModel):
+    cipertext: str
+    nonce: str
+    key_version: int = 1
+
+
 class MessageResponse(BaseModel):
     id: int
     message_uuid: UUID
     conversation_id: int
     sender_id: int
-    content: str
+    
+    cipertext: str
+    nonce: str
+    key_version: int
     created_At: datetime
 
-    model_config = {"from_attributes": True}
+    class Config:
+        from_attributes = True

@@ -23,27 +23,19 @@ class ConnectionManager:
 
     async def connect(self, user_id: int, websocket: WebSocket):
         await websocket.accept()
-        # Strictly cast to int
         self.active_connections[int(user_id)] = websocket
         print(f"[{settings.SERVER_ID}] User {user_id} connected locally.")
-        
-        # --- STAGE 4: Mark Presence Online ---
         await presence_service.mark_online(user_id)
-        # -------------------------------------
 
     async def disconnect(self, user_id: int):
         safe_id = int(user_id)
         if safe_id in self.active_connections:
             del self.active_connections[safe_id]
             print(f"[{settings.SERVER_ID}] User {safe_id} disconnected.")
-            
-            # --- STAGE 4: Mark Presence Offline ---
             await presence_service.mark_offline(safe_id)
-            # --------------------------------------
 
     async def send_personal_message(self, message: str, target_user_id: int):
         safe_target = int(target_user_id)
-        
         if safe_target in self.active_connections:
             websocket = self.active_connections[safe_target]
             await websocket.send_text(message)
@@ -53,27 +45,19 @@ class ConnectionManager:
 
 
     async def close_all(self):
-        """Cleanly disconnects all active local WebSockets during server shutdown."""
-        # Create a copy of the keys so we don't modify the dictionary while iterating
         active_users = list(self.active_connections.keys())
         for user_id in active_users:
             try:
                 websocket = self.active_connections[user_id]
-                # Send a standard WS close code 1001 (Going Away)
                 await websocket.close(code=1001, reason="Server shutting down")
-                
-                # Update Redis presence to offline before Redis shuts down
                 await presence_service.mark_offline(user_id)
                 print(f"[{settings.SERVER_ID}] Cleanly closed WebSocket for User {user_id} during shutdown.")
             except Exception as e:
                 print(f"[{settings.SERVER_ID}] Error closing WebSocket for User {user_id}: {e}")
-        
-        # Clear the dictionary
         self.active_connections.clear()
         
 manager = ConnectionManager()
 
-# websocket authentication helper
 async def get_ws_user_id(token: str) -> int | None:
     try:
         payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
@@ -82,87 +66,90 @@ async def get_ws_user_id(token: str) -> int | None:
     except (jwt.PyJWTError, ValidationError, ValueError):
         return None
 
-# WebSocket endpoint for chat
+
 @router.websocket("/ws/chat")
 async def websocket_endpoint(
     websocket: WebSocket,
     token: str = Query(...), 
     db: AsyncSession = Depends(get_db)
 ):
-    # 1. Authenticate the WebSocket connection
     user_id = await get_ws_user_id(token)
     if not user_id:
         await websocket.close(code=1008) 
         return
     
-    # 2. Accept connection
     await manager.connect(user_id, websocket)
     chat_service = ChatService(db)
     
     try:
         while True:
-            # 3. Wait for messages from this user
-            
             try:
-
-                data = await asyncio.wait_for(websocket.receive_text(), timeout=45.0) # if we dont here anything for 45s it raise a error
-
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=45.0) 
             except asyncio.TimeoutError:
                 print(f"[{settings.SERVER_ID}] User {user_id} timed out (Ghost Connection). Forcing disconnect.")
-                break  # Exit the loop to disconnect the user
+                break 
             
             try:
-
                 payload = json.loads(data)
-            
             except json.JSONDecodeError:
                 print(f"[{settings.SERVER_ID}] Invalid JSON received: {data}")
                 await websocket.send_text(json.dumps({"error": "Message must be valid JSON."}))
                 continue 
             
-            # --- STAGE 4: INTERCEPT HEARTBEATS ---
             if payload.get("type") == "ping":
-                # Refresh the Redis TTL clock!
-                await presence_service.refresh_presence(user_id) # keep user alive by sending keep alive to redis
-                
-                # Send a pong back to the client so it knows the server is alive
+                await presence_service.refresh_presence(user_id) 
                 await websocket.send_text(json.dumps({"type": "pong"}))
                 continue
-            # -------------------------------------
             
-            # --- NORMAL CHAT MESSAGE VALIDATION ---
-            if "conversation_id" not in payload or "target_user_id" not in payload or "content" not in payload:
-                await websocket.send_text(json.dumps({"error": "Missing required fields."}))
+            # --- E2EE CHAT MESSAGE VALIDATION ---
+            if "conversation_id" not in payload or "target_user_id" not in payload:
+                await websocket.send_text(json.dumps({"error": "Missing conversation_id or target_user_id."}))
+                continue
+                
+            # Allow BOTH E2EE (cipertext) and Stage 3 (content) payloads for backwards compatibility
+            has_e2ee = "cipertext" in payload and "nonce" in payload
+            has_stage3 = "content" in payload
+
+            if not has_e2ee and not has_stage3:
+                await websocket.send_text(json.dumps({"error": "Message must contain either 'cipertext' and 'nonce' (E2EE), or 'content' (Legacy)."}))
                 continue
                 
             conv_id = int(payload.get("conversation_id"))
             target_id = int(payload.get("target_user_id"))
-            content = payload.get("content")
             
             # 4. Save to PostgreSQL AND Outbox
+            # Note: We must update chat_service.save_message next to handle these new fields!
             saved_msg = await chat_service.save_message(
                 conversation_id=conv_id,
                 sender_id=user_id,
                 target_id=target_id, 
-                content=content
+                content=payload.get("content"), # Will be None if E2EE
+                cipertext=payload.get("cipertext"),
+                nonce=payload.get("nonce"),
+                key_version=payload.get("key_version", 1)
             )
             
-            # 5. Prepare the outgoing message JSON
+            # 5. Prepare the outgoing message JSON (E2EE Envelope!)
             outbound_msg = {
                 "id": saved_msg.id,
                 "message_uuid": str(saved_msg.message_uuid),
                 "conversation_id": conv_id,
                 "sender_id": user_id,
-                "content": content,
-                "created_at": saved_msg.created_at.isoformat()
+                "created_at": saved_msg.created_at.isoformat(),
+                "key_version": getattr(saved_msg, "key_version", 1)
             }
+
+            # Attach E2EE or Legacy fields depending on what was saved
+            if payload.get("cipertext"):
+                outbound_msg["cipertext"] = payload.get("cipertext")
+                outbound_msg["nonce"] = payload.get("nonce")
+            else:
+                outbound_msg["content"] = payload.get("content")
             
             # 6. Echo back to sender instantly via Redis
             await redis_manager.publish_message(user_id, outbound_msg)
             
     except WebSocketDisconnect:
         print(f"[{settings.SERVER_ID}] User {user_id} disconnected normally.")
-
     finally:
-        # finally gurantees this perform a clean exit even if the user disconnects unexpectedly or an error occurs
         await manager.disconnect(user_id)

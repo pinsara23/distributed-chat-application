@@ -6,7 +6,7 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-PRIVATE_KEY_FILE = "local_identity.key"
+PRIVATE_KEY_FILE = "bob.key"
 
 class CryptoService:
     def __init__(self):

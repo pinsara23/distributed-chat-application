@@ -14,6 +14,7 @@ from app.core.database import AsyncSessionLocal
 from app.models.message import Message
 from app.core.encryption import encryption_service
 from app.messaging.redis_client import redis_manager
+import base64
 
 async def  on_message(message:aio_pika.abc.AbstractIncomingMessage):
     # Callback function when fires new message arrives to the queue
@@ -49,21 +50,23 @@ async def  on_message(message:aio_pika.abc.AbstractIncomingMessage):
                 db_message = result.scalar_one_or_none()
 
                 if db_message:
-                    plaintext = encryption_service.decrypt(db_message.cipertext, db_message.nonce)
+                    # Safely convert bytes to strings for JSON
+                    cipertext_str = base64.b64encode(db_message.cipertext).decode('utf-8') if isinstance(db_message.cipertext, bytes) else db_message.cipertext
+                    nonce_str = base64.b64encode(db_message.nonce).decode('utf-8') if isinstance(db_message.nonce, bytes) else db_message.nonce
 
                     ws_payload = {
                         "id": db_message.id,
                         "message_uuid": str(db_message.message_uuid),
                         "conversation_id": db_message.conversation_id,
                         "sender_id": db_message.sender_id,
-                        "content": plaintext,
+                        "cipertext": cipertext_str, 
+                        "nonce": nonce_str,
+                        "key_version": getattr(db_message, 'key_version', 1),
                         "created_at": db_message.created_at.isoformat()
                     }
 
-                    # hends off to redis
                     await redis_manager.publish_message(target_user_id, ws_payload)
-                    print(f"[{settings.SERVER_ID}] Pushed to Redis for User {target_user_id}")
-
+                    print(f"[{settings.SERVER_ID}] Pushed E2EE Envelope to Redis for User {target_user_id}")
 
         await redis_manager.redis.set(idempotency_key, "1", ex=86400)  # Set key with 24-hour expiration
 

@@ -2,6 +2,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 from sqlalchemy.orm import selectinload
 from fastapi import HTTPException, status
+import base64
 
 from app.models.user import User
 from app.models.conversation import Conversation, ConversationParticipant
@@ -22,7 +23,6 @@ class ChatService:
                 detail="Cannot create a conversation with yourself.",
             )
 
-        # 1. Check if target user exists
         target_user = await self.db.execute(select(User).where(target_user_id == User.id))
         if not target_user.scalars().first():
             raise HTTPException(
@@ -30,9 +30,6 @@ class ChatService:
                 detail="Target user not found.",
             )
         
-        # 2. Check if a one-to-one conversation already exists between these two users
-        # This is a bit complex in SQL, but we look for a conversation where both users are participants
-
         query = (
             select(Conversation.id)
             .join(ConversationParticipant, Conversation.id == ConversationParticipant.conversation_id)
@@ -48,12 +45,10 @@ class ChatService:
             conversation = await self.db.execute(select(Conversation).where(Conversation.id == existing_conversation_id))
             return conversation.scalars().first()
 
-        # 3. Create new conversation if not existing one
         new_conv = Conversation()
         self.db.add(new_conv)
-        await self.db.flush()  # Flush to get the new conversation ID
+        await self.db.flush() 
 
-        # 4. Add both users as participants
         p1 = ConversationParticipant(conversation_id=new_conv.id, user_id=current_user_id)
         p2 = ConversationParticipant(conversation_id=new_conv.id, user_id=target_user_id)
         self.db.add_all([p1, p2])
@@ -76,7 +71,6 @@ class ChatService:
 
 
     async def get_conversation_messages(self, user_id: int, conversation_id: int, page: int, limit: int) -> list[Message]:
-        # 1. Authorization check: Is user a participant of the conversation?
         participant_check = await self.db.execute(
             select(ConversationParticipant)
             .where(
@@ -92,7 +86,6 @@ class ChatService:
                 detail="You are not a participant of this conversation.",
             )
 
-        # fech the messages with paginations 
         offset = (page - 1) * limit
         query = (
             select(Message)
@@ -104,9 +97,7 @@ class ChatService:
         result = await self.db.execute(query)
         return result.scalars().all()
 
-    # use this for if client got disconnected and want to fetch missed messages because pub/sub is doesnt store anuthing "fire and forget"
     async def get_missed_messages(self, conversation_id: int, after_id: int):
-        """Fetches all messages in a conversation strictly after the provided message ID."""
         stmt = (
             select(Message)
             .where(Message.conversation_id == conversation_id)
@@ -116,21 +107,41 @@ class ChatService:
         result = await self.db.execute(stmt)
         return result.scalars().all()
 
-    async def save_message(self, conversation_id: int, sender_id: int, target_id: int, content: str) -> Message:
-
-        cipher, nonce, version = encryption_service.encrypt(content)
+    async def save_message(
+        self, 
+        conversation_id: int, 
+        sender_id: int, 
+        target_id: int, 
+        content: str = None, 
+        cipertext: str = None, 
+        nonce: str = None, 
+        key_version: int = 1
+    ) -> Message:
+        
+        # --- STAGE 4 E2EE INTEGRATION ---
+        # If the client sent E2EE ciphertext, we save it directly (converting the Base64 string to bytes for the DB).
+        if cipertext and nonce:
+            final_cipher = base64.b64decode(cipertext)
+            final_nonce = base64.b64decode(nonce)
+            final_version = key_version
+        
+        # --- STAGE 3 LEGACY FALLBACK ---
+        # If the client sent plaintext content, encrypt it using the server key like we used to.
+        elif content:
+            final_cipher, final_nonce, final_version = encryption_service.encrypt(content)
+        else:
+            raise ValueError("Message must contain either 'cipertext' or 'content'")
 
         new_message = Message(
             conversation_id=conversation_id,
             sender_id=sender_id,
-            cipertext=cipher,
-            nonce=nonce,
-            encryption_version=version
+            cipertext=final_cipher,
+            nonce=final_nonce,
+            encryption_version=final_version,
         )
 
         self.db.add(new_message)
-
-        await self.db.flush()  # Flush to get the new message ID
+        await self.db.flush() 
         
         payload = MessageCreatePayload(
             message_id=new_message.message_uuid,

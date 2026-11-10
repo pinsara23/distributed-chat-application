@@ -49,31 +49,28 @@ async def get_messages(
             limit=limit
         )
         
-    # 2. Safely convert ORM models to dictionaries
+    # 2. Return E2EE Envelopes
     result = []
     for msg in messages:
         timestamp = getattr(msg, "created_at", getattr(msg, "created_At", None))
         timestamp_str = timestamp.isoformat() if timestamp else None
         
-        # --- STAGE 4: Safely handle the cipertext bytes column ---
-        safe_content = ""
-        if hasattr(msg, 'cipertext') and msg.cipertext:
-            try:
-                # If the bytes are just plain text encoded as utf-8
-                safe_content = msg.cipertext.decode('utf-8')
-            except UnicodeDecodeError:
-                # If it is actual encrypted binary data, base64 encode it for JSON
-                safe_content = base64.b64encode(msg.cipertext).decode('utf-8')
-        # ---------------------------------------------------------
+        # Depending on your SQLAlchemy DB setup, cipertext/nonce might be returned as bytes or strings.
+        # This safely handles both, ensuring they are returned as Base64 strings to the client.
+        cipertext_str = msg.cipertext.decode('utf-8') if isinstance(msg.cipertext, bytes) else msg.cipertext
+        
+        nonce_val = getattr(msg, 'nonce', '')
+        nonce_str = nonce_val.decode('utf-8') if isinstance(nonce_val, bytes) else nonce_val
         
         result.append({
             "id": msg.id,
             "message_uuid": str(msg.message_uuid) if getattr(msg, "message_uuid", None) else None,
             "conversation_id": msg.conversation_id,
             "sender_id": msg.sender_id,
-            "content": safe_content,  # <-- Mapped from cipertext!
-            "created_at": timestamp_str,
-            "created_At": timestamp_str
+            "cipertext": cipertext_str,
+            "nonce": nonce_str,
+            "key_version": getattr(msg, 'key_version', 1),
+            "created_at": timestamp_str
         })
         
     return result
