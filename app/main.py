@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import auth, conversations, presence, health 
+from app.api import auth, conversations, presence, health, keys
 from app.websocket import chat  
 from app.messaging.redis_client import redis_manager
 from app.messaging.rabbitmq.connection import rabbitmq_manager
@@ -56,6 +56,7 @@ app.include_router(conversations.router, prefix="/conversations", tags=["Convers
 app.include_router(chat.router)
 app.include_router(presence.router, prefix="/users", tags=["Presence"])
 app.include_router(health.router, prefix="/health", tags=["Health"])
+app.include_router(keys.router, prefix="/keys", tags=["Keys"])
 
 @app.get("/")
 async def root():

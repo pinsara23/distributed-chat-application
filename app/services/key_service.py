@@ -1,0 +1,34 @@
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from app.models.public_key import PublicKey
+
+class KeyService:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def upload_or_update_key(self, user_id: int, public_key_pem: str) -> PublicKey:
+        """Upserts a public key for a user and manages versioning."""
+
+        stmt = select (PublicKey).where(PublicKey.user_id == user_id)
+        resullt = await self.db.execute(stmt)
+        existing_key = resullt.scalar_one_or_none()
+
+        if existing_key:
+            # Update the existing key and increment the version
+            existing_key.public_key_pem = public_key_pem
+            existing_key.key_version += 1
+            db_key = existing_key
+        else:
+            # Create a new public key entry
+            db_key = PublicKey(user_id=user_id, public_key_pem=public_key_pem, key_version=1)
+            self.db.add(db_key)
+
+        await self.db.commit()
+        await self.db.refresh(db_key)
+        return db_key
+
+    async def get_key_by_user_id(self, user_id: int) -> PublicKey | None:
+        """Fetches the public key for a given user ID."""
+        stmt = select(PublicKey).where(PublicKey.user_id == user_id)
+        result = await self.db.execute(stmt)
+        return result.scalar_one_or_none()
