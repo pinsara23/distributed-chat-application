@@ -15,3 +15,5 @@ __pycache__/
 
 stage3_prompt.txt
 stage4_propmt.txt
+
+local_identity.key

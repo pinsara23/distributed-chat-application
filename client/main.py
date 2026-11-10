@@ -3,9 +3,11 @@ import websockets
 import httpx
 import json
 import random
+import aiohttp
+from crypto import crypto_service
 
 # TODO: Paste Alice's token here!
-TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZXhwIjoxNzk0MzM3NjMzfQ.IXqjV_w2oRNhHBGsgRVgdhfQ96hi7TpVLuKUgV3GdKI"
+TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZXhwIjoxNzk0MzQzNTMyfQ.XpYPqQ31P4eWOTPzAm2w0Busvu2BSzAigX64uiEAcsI"
 WS_URL = f"ws://127.0.0.1:8000/ws/chat?token={TOKEN}"
 REST_URL = "http://127.0.0.1:8000"
 
@@ -77,6 +79,35 @@ async def listen(websocket):
     except websockets.exceptions.ConnectionClosed:
         pass
 
+
+async def register_public_key():
+    """Generates local keys and uploads the public key to the server."""
+    # 1. Generate or load keys
+    crypto_service.load_or_generate_keys()
+    
+    # 2. Print our Security Fingerprint
+    fingerprint = crypto_service.get_fingerprints(crypto_service.public_key_pem)
+    print(f"\n==================================================")
+    print(f"🔐 MY SECURITY FINGERPRINT:")
+    print(f"{fingerprint}")
+    print(f"==================================================\n")
+
+    # 3. Upload public key to server
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    payload = {"public_key_pem": crypto_service.public_key_pem}
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{REST_URL}/keys/", headers=headers, json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    print(f"[Client] Public Key (v{data['key_version']}) successfully registered with server.")
+                else:
+                    print(f"[Client] ⚠️ Failed to register Public Key: {await resp.text()}")
+    except Exception as e:
+        print(f"[Client] ⚠️ API Connection error: {e}")
+
+
 async def connect_with_retry():
     base_delay = 1
     max_delay = 16
@@ -103,5 +134,13 @@ async def connect_with_retry():
         await asyncio.sleep(delay)
         base_delay = min(base_delay * 2, max_delay)
 
+
+async def start_client():
+    await register_public_key()
+    await connect_with_retry()
+
 if __name__ == "__main__":
-    asyncio.run(connect_with_retry())
+    try:
+        asyncio.run(start_client())
+    except KeyboardInterrupt:
+        print("\n[Client] Exiting...")
