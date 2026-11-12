@@ -27,7 +27,7 @@ def upgrade() -> None:
     sa.Column('event_type', sa.String(length=100), nullable=False),
     sa.Column('payload', sa.JSON(), nullable=False),
     sa.Column('created_at', sa.DateTime(), nullable=False),
-    sa.Column('publised_at', sa.DateTime(), nullable=True),
+    sa.Column('published_at', sa.DateTime(), nullable=True),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_outbox_events_event_id'), 'outbox_events', ['event_id'], unique=True)

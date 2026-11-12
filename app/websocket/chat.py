@@ -1,7 +1,8 @@
 import json
+import binascii
 import jwt
 from pydantic import ValidationError
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, Query
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, Query, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
 
@@ -9,6 +10,7 @@ from app.core.database import get_db
 from app.core.config import settings
 from app.schemas.auth import TokenPayload
 from app.services.chat_service import ChatService
+from app.schemas.message import serialize_message
 from app.messaging.redis_client import redis_manager
 
 # --- STAGE 4: Import the Presence Service ---
@@ -119,25 +121,25 @@ async def websocket_endpoint(
             
             # 4. Save to PostgreSQL AND Outbox
             # Note: We must update chat_service.save_message next to handle these new fields!
-            saved_msg = await chat_service.save_message(
-                conversation_id=conv_id,
-                sender_id=user_id,
-                target_id=target_id, 
-                content=payload.get("content"), # Will be None if E2EE
-                cipertext=payload.get("cipertext"),
-                nonce=payload.get("nonce"),
-                key_version=payload.get("key_version", 1)
-            )
+            try:
+                saved_msg = await chat_service.save_message(
+                    conversation_id=conv_id,
+                    sender_id=user_id,
+                    target_id=target_id,
+                    content=payload.get("content"), # Will be None if E2EE
+                    cipertext=payload.get("cipertext"),
+                    nonce=payload.get("nonce"),
+                    key_version=payload.get("key_version", 1)
+                )
+            except HTTPException as exc:
+                await websocket.send_text(json.dumps({"error": exc.detail}))
+                continue
+            except (ValueError, binascii.Error):
+                await websocket.send_text(json.dumps({"error": "Invalid message encoding."}))
+                continue
             
             # 5. Prepare the outgoing message JSON (E2EE Envelope!)
-            outbound_msg = {
-                "id": saved_msg.id,
-                "message_uuid": str(saved_msg.message_uuid),
-                "conversation_id": conv_id,
-                "sender_id": user_id,
-                "created_at": saved_msg.created_at.isoformat(),
-                "key_version": getattr(saved_msg, "key_version", 1)
-            }
+            outbound_msg = serialize_message(saved_msg)
 
             # Attach E2EE or Legacy fields depending on what was saved
             if payload.get("cipertext"):

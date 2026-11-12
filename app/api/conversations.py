@@ -1,12 +1,11 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-import base64
 
 from app.core.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
 from app.schemas.conversation import ConversationCreate, ConversationResponse
-from app.schemas.message import MessageResponse
+from app.schemas.message import serialize_message
 from app.services.chat_service import ChatService
 
 router = APIRouter()
@@ -40,7 +39,11 @@ async def get_messages(
 ):
     # 1. Fetch the raw SQLAlchemy objects
     if after_id > 0:
-        messages = await chat_service.get_missed_messages(conversation_id, after_id)
+        messages = await chat_service.get_missed_messages(
+            user_id=current_user.id,
+            conversation_id=conversation_id,
+            after_id=after_id,
+        )
     else:
         messages = await chat_service.get_conversation_messages(
             user_id=current_user.id,
@@ -49,28 +52,4 @@ async def get_messages(
             limit=limit
         )
         
-    # 2. Return E2EE Envelopes
-    result = []
-    for msg in messages:
-        timestamp = getattr(msg, "created_at", getattr(msg, "created_At", None))
-        timestamp_str = timestamp.isoformat() if timestamp else None
-        
-        # Depending on your SQLAlchemy DB setup, cipertext/nonce might be returned as bytes or strings.
-        # This safely handles both, ensuring they are returned as Base64 strings to the client.
-        cipertext_str = msg.cipertext.decode('utf-8') if isinstance(msg.cipertext, bytes) else msg.cipertext
-        
-        nonce_val = getattr(msg, 'nonce', '')
-        nonce_str = nonce_val.decode('utf-8') if isinstance(nonce_val, bytes) else nonce_val
-        
-        result.append({
-            "id": msg.id,
-            "message_uuid": str(msg.message_uuid) if getattr(msg, "message_uuid", None) else None,
-            "conversation_id": msg.conversation_id,
-            "sender_id": msg.sender_id,
-            "cipertext": cipertext_str,
-            "nonce": nonce_str,
-            "key_version": getattr(msg, 'key_version', 1),
-            "created_at": timestamp_str
-        })
-        
-    return result
+    return [serialize_message(msg) for msg in messages]

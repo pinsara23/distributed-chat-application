@@ -7,13 +7,14 @@ from crypto import crypto_service
 import os
 
 # --- CONFIGURATION ---
-TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZXhwIjoxNzk0NDcyMTgzfQ.Rm3Y-oNbE7D0zVnU2z6HwhvhPzrkEOEw7ZxANHmEA4E" 
+TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZXhwIjoxNzk0NDkxNTYyfQ.6ZgpTK-Up8qqjcsOA6uZASyE6mg6tEUF0GuzthcDp2k" 
 USER_ID = 1
 TARGET_USER_ID = 2
 CONVERSATION_ID = 1
 
-REST_URL = "http://127.0.0.1:8001"
-WS_URL = f"ws://127.0.0.1:8001/ws/chat?token={TOKEN}"
+SERVER_IP = "192.168.43.47"
+REST_URL = f"http://{SERVER_IP}"
+WS_URL = f"ws://{SERVER_IP}/ws/chat?token={TOKEN}"
 
 # --- STEP 22: TOFU STORAGE ---
 KNOWN_HOSTS_FILE = "known_hosts.json"

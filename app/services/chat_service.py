@@ -1,6 +1,5 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
-from sqlalchemy.orm import selectinload
 from fastapi import HTTPException, status
 import base64
 
@@ -29,6 +28,14 @@ class ChatService:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Target user not found.",
             )
+
+        # Serialize creation for this pair inside PostgreSQL so two requests
+        # cannot both observe the pair as absent.
+        bind = self.db.get_bind()
+        if bind.dialect.name == "postgresql":
+            low_id, high_id = sorted((current_user_id, target_user_id))
+            lock_key = (low_id * 1_000_003 + high_id) % 2_147_483_647
+            await self.db.execute(select(func.pg_advisory_xact_lock(lock_key)))
         
         query = (
             select(Conversation.id)
@@ -97,7 +104,14 @@ class ChatService:
         result = await self.db.execute(query)
         return result.scalars().all()
 
-    async def get_missed_messages(self, conversation_id: int, after_id: int):
+    async def get_missed_messages(
+        self, user_id: int, conversation_id: int, after_id: int
+    ):
+        await self._ensure_message_authorized(
+            conversation_id=conversation_id,
+            sender_id=user_id,
+            target_id=user_id,
+        )
         stmt = (
             select(Message)
             .where(Message.conversation_id == conversation_id)
@@ -106,6 +120,22 @@ class ChatService:
         )
         result = await self.db.execute(stmt)
         return result.scalars().all()
+
+    async def _ensure_message_authorized(
+        self, conversation_id: int, sender_id: int, target_id: int
+    ) -> None:
+        result = await self.db.execute(
+            select(ConversationParticipant.user_id).where(
+                ConversationParticipant.conversation_id == conversation_id,
+                ConversationParticipant.user_id.in_([sender_id, target_id]),
+            )
+        )
+        participant_ids = set(result.scalars().all())
+        if sender_id not in participant_ids or target_id not in participant_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Message participants must belong to this conversation.",
+            )
 
     async def save_message(
         self, 
@@ -117,12 +147,17 @@ class ChatService:
         nonce: str = None, 
         key_version: int = 1
     ) -> Message:
+        await self._ensure_message_authorized(
+            conversation_id=conversation_id,
+            sender_id=sender_id,
+            target_id=target_id,
+        )
         
         # --- STAGE 4 E2EE INTEGRATION ---
         # If the client sent E2EE ciphertext, we save it directly (converting the Base64 string to bytes for the DB).
         if cipertext and nonce:
-            final_cipher = base64.b64decode(cipertext)
-            final_nonce = base64.b64decode(nonce)
+            final_cipher = base64.b64decode(cipertext, validate=True)
+            final_nonce = base64.b64decode(nonce, validate=True)
             final_version = key_version
         
         # --- STAGE 3 LEGACY FALLBACK ---

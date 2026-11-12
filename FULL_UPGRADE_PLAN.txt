@@ -1,0 +1,1356 @@
+Distributed Chat Application - Full Upgrade Plan
+================================================
+
+Planning scope
+--------------
+
+This is a planning-only document. The existing architecture is preserved:
+
+React + TypeScript frontend
+            |
+          Nginx
+            |
+   ---------------------
+   |         |         |
+FastAPI  FastAPI  FastAPI
+   |         |         |
+   ------ Shared services ------
+   PostgreSQL | Redis | RabbitMQ
+
+The application remains a distributed monolith with three FastAPI replicas.
+
+
+1. Verified Existing Repository Status
+--------------------------------------
+
+Implemented:
+
+- FastAPI backend
+- PostgreSQL persistence
+- SQLAlchemy async database access
+- Alembic migrations
+- Redis Pub/Sub
+- Redis-based presence
+- RabbitMQ messaging
+- Transactional outbox design
+- Nginx load balancing
+- Three FastAPI backend replicas in Docker Compose
+- JWT authentication
+- Argon2 password hashing
+- WebSocket messaging
+- Python E2EE clients
+- X25519 key agreement
+- HKDF-SHA256
+- AES-GCM encryption
+- Basic REST message history retrieval
+- Basic reconnect loop in Python clients
+- Unit and integration-style tests
+
+Partially implemented:
+
+- Offline message recovery
+- WebSocket reconnection
+- RabbitMQ retry handling
+- Redis idempotency
+- E2EE key rotation
+- Cross-instance WebSocket delivery
+- Health and readiness checks
+- Deployment migration process
+- CI/CD validation
+- Message ordering
+- Duplicate prevention
+
+Broken or suspicious:
+
+- The outbox migration uses "publised_at", while application code uses
+  "published_at".
+- WebSocket messages do not verify conversation membership.
+- The "after_id" history path does not consistently verify authorization.
+- Multiple backend replicas can publish the same outbox event.
+- Redis idempotency uses non-atomic exists() followed by set().
+- Message ciphertext encoding is inconsistent between endpoints.
+- key_version and encryption_version are inconsistent.
+- Python clients reconnect but do not replay missed messages.
+- RabbitMQ and Redis listener recovery is incomplete.
+- Existing deployment does not automatically run migrations.
+
+Missing:
+
+- React frontend
+- User search endpoint
+- Frontend conversation selection
+- Frontend message synchronization
+- Frontend E2EE implementation
+- Browser key storage
+- Delivery/read status
+- Typing indicators
+- Presence UI
+- Message pagination UI
+- Automated distributed-system tests
+- Controlled migration job in Docker Compose
+- Production TLS configuration
+- Frontend CI checks
+
+
+2. Existing API Inventory
+-------------------------
+
+Authentication:
+
+POST /auth/register
+POST /auth/login
+
+Registration accepts:
+
+{
+  "username": "alice",
+  "email": "alice@example.com",
+  "password": "password"
+}
+
+Login uses form data:
+
+username=alice
+password=password
+
+Login returns:
+
+{
+  "access_token": "...",
+  "token_type": "bearer"
+}
+
+Conversations:
+
+POST /conversations/
+GET /conversations/
+GET /conversations/{conversation_id}/messages
+
+Current limitations:
+
+- Conversation responses only contain ID and creation time.
+- The frontend cannot display participant names without additional APIs.
+- The history endpoint has authorization and encoding inconsistencies.
+- There is no user-search endpoint.
+
+Presence:
+
+GET /users/{target_user_id}/presence
+
+Public keys:
+
+POST /keys/
+GET /keys/{user_id}
+
+Health:
+
+GET /health/live
+GET /health/ready
+
+Current readiness checks include PostgreSQL and Redis. RabbitMQ is not
+currently included.
+
+WebSocket:
+
+/ws/chat?token=<jwt>
+
+Current message payload:
+
+{
+  "conversation_id": 1,
+  "target_user_id": 2,
+  "cipertext": "base64 ciphertext",
+  "nonce": "base64 nonce",
+  "key_version": 1
+}
+
+The field "cipertext" is misspelled but is part of the current protocol.
+It should not be renamed without a compatibility migration.
+
+
+3. Existing Database Schema
+---------------------------
+
+users:
+
+- id
+- username
+- email
+- password_hash
+- created_at
+
+Username and email are unique.
+
+conversations:
+
+- id
+- created_at
+
+conversation_participants:
+
+- id
+- conversation_id
+- user_id
+- joined_at
+
+There is currently no unique constraint on (conversation_id, user_id).
+
+messages:
+
+- id
+- message_uuid
+- conversation_id
+- sender_id
+- cipertext
+- nonce
+- encryption_version
+- created_at
+
+outbox_events:
+
+- id
+- event_id
+- event_type
+- payload
+- created_at
+- published_at
+
+Migration issue:
+
+Migration: publised_at
+Model:     published_at
+
+public_keys:
+
+- id
+- user_id
+- public_key_pem
+- key_version
+- created_at
+
+
+4. Existing Message Lifecycle
+-----------------------------
+
+Client encrypts message
+        |
+        v
+WebSocket receives ciphertext
+        |
+        v
+FastAPI validates JWT
+        |
+        v
+PostgreSQL stores message and outbox event
+        |
+        v
+Outbox publisher sends event to RabbitMQ
+        |
+        v
+RabbitMQ consumer retrieves message from PostgreSQL
+        |
+        v
+Consumer publishes ciphertext to Redis
+        |
+        v
+FastAPI instance holding recipient WebSocket receives event
+        |
+        v
+Recipient decrypts message locally
+
+Current lifecycle problems:
+
+1. WebSocket sender authorization is incomplete.
+2. Conversation membership is not verified.
+3. Duplicate client submissions are not prevented.
+4. Outbox publication can race across replicas.
+5. Redis Pub/Sub is not durable.
+6. Reconnect does not automatically replay missed messages.
+7. Message ordering is not guaranteed.
+8. Sender and recipient delivery semantics are not explicitly modeled.
+
+
+5. Critical Backend Changes
+---------------------------
+
+Priority 0 - Security and correctness
+
+5.1 Secure WebSocket authorization
+
+Affected files:
+
+app/websocket/chat.py
+app/services/chat_service.py
+
+Add a service method that verifies:
+
+- Sender belongs to the conversation.
+- Target belongs to the conversation.
+- Conversation exists.
+- Target user exists.
+
+The check must happen before inserting the message.
+
+Expected behavior:
+
+- Return a WebSocket authorization error.
+- Do not insert a database message.
+- Do not create an outbox event.
+- Do not publish to Redis.
+
+The WebSocket must not trust only conversation_id and target_user_id supplied
+by the client.
+
+5.2 Secure message history authorization
+
+Affected files:
+
+app/api/conversations.py
+app/services/chat_service.py
+
+Both normal pagination and after_id retrieval must verify that the
+authenticated user belongs to the conversation.
+
+5.3 Fix migration consistency
+
+Affected files:
+
+alembic/versions/
+app/models/outbox_events.py
+app/messaging/rabbitmq/publisher.py
+
+Do not edit an already-applied migration. Create a new corrective migration
+that:
+
+1. Detects publised_at.
+2. Renames it to published_at.
+3. Preserves existing data.
+4. Verifies the final schema.
+
+The migration must be tested against a real PostgreSQL database.
+
+5.4 Fix encrypted message serialization
+
+Affected files:
+
+app/api/conversations.py
+app/websocket/chat.py
+app/messaging/rabbitmq/consumer.py
+app/schemas/message.py
+app/models/message.py
+
+Use one consistent format:
+
+Database: bytes
+API/WebSocket: Base64 string
+Client: Base64 string
+
+Use Base64 encoding for binary message fields. Never decode arbitrary
+ciphertext bytes as UTF-8.
+
+5.5 Standardize protocol naming
+
+The existing field is cipertext. Do not silently rename it.
+
+Recommended compatibility approach:
+
+Protocol v1:
+    cipertext
+
+Protocol v2:
+    ciphertext
+
+During migration:
+
+- Accept both fields.
+- Prefer ciphertext.
+- Emit the negotiated protocol field.
+- Eventually deprecate cipertext.
+
+Apply the same approach to key_version and encryption_version.
+
+
+6. Conversation Improvements
+----------------------------
+
+The frontend should search for a user and call:
+
+POST /conversations/
+
+The backend should return an existing direct conversation or create one.
+
+Duplicate-conversation prevention:
+
+Affected files:
+
+app/models/conversation.py
+app/services/chat_service.py
+alembic/versions/<new_migration>.py
+
+Recommended design:
+
+1. Normalize the two user IDs.
+2. Store a deterministic direct-conversation key.
+3. Add a unique database constraint.
+
+Example conceptual key:
+
+direct:<lower_user_id>:<higher_user_id>
+
+A database constraint is required because application-level checks alone are
+not safe under concurrency.
+
+
+7. User Search API
+------------------
+
+No user-search endpoint currently exists.
+
+Recommended endpoint:
+
+GET /users/search?q=ali&limit=20
+
+Response:
+
+[
+  {
+    "id": 1,
+    "username": "alice",
+    "display_name": "alice"
+  }
+]
+
+Security requirements:
+
+- Require authentication.
+- Do not return email addresses by default.
+- Limit result size.
+- Require a minimum query length.
+- Add an appropriate search index.
+- Add rate limiting later.
+
+Files to create or modify:
+
+app/api/users.py
+app/services/user_service.py
+app/schemas/user.py
+app/main.py
+alembic/versions/<user_search_index_migration>.py
+
+
+8. Conversation API Improvements
+---------------------------------
+
+The current conversation response is too small for a WhatsApp-style
+interface.
+
+Recommended response:
+
+{
+  "id": 1,
+  "created_at": "2026-11-12T12:00:00Z",
+  "participant": {
+    "id": 2,
+    "username": "bob"
+  },
+  "last_message": {
+    "message_uuid": "...",
+    "created_at": "...",
+    "sender_id": 1
+  },
+  "presence": {
+    "status": "online"
+  }
+}
+
+Keep the existing fields and add optional fields to avoid breaking current
+clients.
+
+Affected files:
+
+app/schemas/conversation.py
+app/services/chat_service.py
+app/api/conversations.py
+
+
+9. Outbox Reliability Plan
+--------------------------
+
+Current problem:
+
+Every FastAPI replica runs an outbox publisher. Without row claiming:
+
+Server 1 reads event A
+Server 2 reads event A
+Server 3 reads event A
+All publish event A
+
+Required outbox fields:
+
+- published_at
+- claimed_at
+- claim_owner
+- attempt_count
+- last_error
+
+Required behavior:
+
+1. Claim a bounded batch.
+2. Publish events.
+3. Use RabbitMQ publisher confirms.
+4. Mark successful events as published.
+5. Increment retry state on failure.
+6. Release or expire abandoned claims.
+
+Use SELECT FOR UPDATE SKIP LOCKED or an equivalent leasing mechanism.
+
+Affected files:
+
+app/models/outbox_events.py
+app/messaging/rabbitmq/publisher.py
+alembic/versions/<outbox_claiming_migration>.py
+
+
+10. Duplicate Processing and Idempotency
+----------------------------------------
+
+Current consumer behavior:
+
+exists(key)
+process event
+set(key)
+
+Two consumers can pass the exists() check at the same time.
+
+Use an atomic Redis operation:
+
+SET processed_event:<event_id> 1 NX EX 86400
+
+Only the consumer that successfully creates the key should process the
+event.
+
+A safer state model is:
+
+processing
+completed
+
+Another option is storing processed events in PostgreSQL with a unique
+event_id and performing the check transactionally.
+
+Affected files:
+
+app/messaging/rabbitmq/consumer.py
+tests/test_stage3.py
+
+
+11. RabbitMQ Retry Improvements
+-------------------------------
+
+Recommended retry policy:
+
+Transient infrastructure error:
+    retry
+
+Malformed event:
+    dead-letter immediately
+
+Missing message row:
+    retry briefly, then dead-letter
+
+Invalid target:
+    dead-letter
+
+Permanent schema error:
+    dead-letter and alert
+
+Do not treat every exception as retryable.
+
+Add event_id, retry_count, and last_error to structured logs.
+
+Affected files:
+
+app/messaging/rabbitmq/consumer.py
+app/messaging/rabbitmq/connection.py
+tests/test_stage3.py
+
+
+12. Redis Listener Recovery
+---------------------------
+
+Current behavior:
+
+- The Redis listener runs as a background task.
+- Unexpected exceptions terminate the task.
+- No supervisor restarts it.
+
+Required behavior:
+
+connect
+subscribe
+listen
+on disconnect:
+    close resources
+    exponential backoff
+    reconnect
+    resubscribe
+
+Affected files:
+
+app/messaging/redis_client.py
+app/main.py
+
+Expose health state such as:
+
+- redis_listener_connected
+- redis_listener_last_error
+- redis_listener_last_connected_at
+
+
+13. WebSocket Connection Management
+------------------------------------
+
+Current design:
+
+dict[user_id, websocket]
+
+This creates a race when the same user connects from multiple tabs or
+devices.
+
+Recommended structure:
+
+dict[user_id, dict[connection_id, WebSocket]]
+
+Each connection should have:
+
+- connection_id
+- user_id
+- created_at
+- last_seen_at
+
+Disconnect should remove only the specific connection that closed.
+
+Presence should remain online while at least one active connection exists.
+
+Affected files:
+
+app/websocket/chat.py
+app/presence/service.py
+tests/test_websocket.py
+
+
+14. Message Ordering
+--------------------
+
+The current system does not guarantee strict ordering.
+
+Recommended approach:
+
+- Use database id or a server-generated sequence per conversation.
+- Return message_id and created_at.
+- Order history by (created_at, id).
+- Use id as the deterministic tie-breaker.
+- Add client-side duplicate filtering.
+- Do not rely only on timestamps.
+
+Recommended message envelope:
+
+{
+  "message_uuid": "...",
+  "sequence": 123,
+  "conversation_id": 1,
+  "sender_id": 1,
+  "created_at": "...",
+  "ciphertext": "...",
+  "nonce": "...",
+  "protocol_version": 2
+}
+
+
+15. Offline Recovery and Reconnection
+-------------------------------------
+
+The browser should store the last received message ID per conversation.
+
+After reconnecting:
+
+1. Authenticate again.
+2. Re-establish the WebSocket.
+3. Request missed messages.
+4. Insert messages in sequence order.
+5. Deduplicate by message_uuid.
+6. Resume real-time delivery.
+
+Recommended endpoint behavior:
+
+GET /conversations/{id}/messages?after_id=100&limit=100
+
+Response:
+
+{
+  "messages": [],
+  "has_more": false,
+  "next_after_id": 150
+}
+
+Affected files:
+
+app/api/conversations.py
+app/services/chat_service.py
+app/schemas/message.py
+frontend/src/features/messages/
+
+
+16. E2EE Compatibility Plan
+---------------------------
+
+The Python clients currently use:
+
+- X25519
+- PEM public keys
+- HKDF-SHA256
+- HKDF info: distributed-chat-e2ee-v1
+- AES-GCM
+- 12-byte random nonce
+- Base64 ciphertext
+- Base64 nonce
+- Server-stored public keys
+- TOFU fingerprints
+
+The browser implementation must preserve these exact parameters for
+compatibility.
+
+Browser implementation options:
+
+Option A - Web Crypto:
+
+Use native browser APIs if the selected browser targets support the required
+X25519, HKDF, AES-GCM, and SPKI operations.
+
+Option B - libsodium:
+
+Use a maintained browser-compatible library for exact X25519 compatibility.
+Key format conversion must be verified.
+
+Option C - Noble cryptography library:
+
+Use a maintained TypeScript library only after verifying that its X25519,
+HKDF, and AES-GCM outputs match the Python implementation.
+
+Required compatibility tests:
+
+- Public-key import and export
+- Fingerprint generation
+- Shared-key derivation
+- HKDF output
+- AES-GCM encryption and decryption
+- Nonce encoding
+- Ciphertext encoding
+- Tamper detection
+- Wrong-key rejection
+
+Do not silently change:
+
+- Cryptographic algorithms
+- Key formats
+- HKDF info
+- Nonce size
+- Ciphertext format
+- Field names
+- Key-version semantics
+
+If changes are necessary, introduce:
+
+- protocol_version
+- encryption_version
+- key_version
+
+and support both protocol versions during migration.
+
+Browser key storage should use IndexedDB and non-extractable CryptoKey where
+possible. Avoid localStorage and plain JSON private-key storage.
+
+Affected files:
+
+client/crypto.py
+client_bob/crypto.py
+app/api/keys.py
+app/services/key_service.py
+app/schemas/key.py
+new frontend encryption modules
+new E2EE compatibility tests
+
+
+17. React Frontend Architecture
+--------------------------------
+
+No frontend currently exists in the repository.
+
+Create:
+
+frontend/
+├── package.json
+├── tsconfig.json
+├── vite.config.ts
+├── index.html
+├── Dockerfile
+├── src/
+│   ├── main.tsx
+│   ├── App.tsx
+│   ├── routes/
+│   │   ├── LoginPage.tsx
+│   │   ├── RegisterPage.tsx
+│   │   └── ChatPage.tsx
+│   ├── components/
+│   │   ├── AuthGuard.tsx
+│   │   ├── LoadingState.tsx
+│   │   ├── ErrorState.tsx
+│   │   └── ConnectionStatus.tsx
+│   ├── features/
+│   │   ├── auth/
+│   │   │   ├── authApi.ts
+│   │   │   ├── authStore.ts
+│   │   │   └── types.ts
+│   │   ├── users/
+│   │   │   ├── userApi.ts
+│   │   │   ├── UserSearch.tsx
+│   │   │   └── types.ts
+│   │   ├── conversations/
+│   │   │   ├── conversationApi.ts
+│   │   │   ├── ConversationList.tsx
+│   │   │   └── types.ts
+│   │   ├── messages/
+│   │   │   ├── messageApi.ts
+│   │   │   ├── messageStore.ts
+│   │   │   ├── MessageList.tsx
+│   │   │   ├── MessageComposer.tsx
+│   │   │   └── types.ts
+│   │   ├── presence/
+│   │   │   └── presenceApi.ts
+│   │   └── websocket/
+│   │       ├── chatSocket.ts
+│   │       ├── reconnect.ts
+│   │       └── types.ts
+│   ├── lib/
+│   │   ├── apiClient.ts
+│   │   ├── storage.ts
+│   │   └── errors.ts
+│   ├── crypto/
+│   │   ├── keyStore.ts
+│   │   ├── e2ee.ts
+│   │   ├── encoding.ts
+│   │   └── protocol.ts
+│   └── styles/
+│       └── globals.css
+└── tests/
+
+
+18. Frontend User Experience
+----------------------------
+
+Login and registration:
+
+Routes:
+
+/login
+/register
+
+States:
+
+- Loading
+- Invalid credentials
+- Network failure
+- Successful authentication
+- Session expiration
+
+User search:
+
+1. User opens a new-chat action.
+2. User searches by username.
+3. User selects a result.
+4. Frontend calls POST /conversations/.
+5. Backend creates or retrieves the conversation.
+6. Frontend opens the conversation.
+
+Users must never manually enter:
+
+- user_id
+- conversation_id
+- JWT
+
+Conversation list should display:
+
+- Username
+- Online/offline state
+- Last message time
+- Last message preview where safe
+- Unread count if implemented
+- Loading state
+- Empty state
+- Error state
+
+Chat view should display:
+
+- Conversation header
+- Presence status
+- Message history
+- Loading indicator
+- Reconnection state
+- Failed message state
+- Message composer
+- Scroll-to-latest behavior
+- Pagination or infinite scroll
+
+Connection states:
+
+- Connected
+- Connecting
+- Reconnecting
+- Offline
+- Authentication expired
+- Server unavailable
+
+
+19. Nginx and Docker Plan
+-------------------------
+
+Required deployment architecture:
+
+Browser
+   |
+   v
+Nginx
+   |-- static React files
+   |-- REST API -> FastAPI replicas
+   |-- WebSocket -> FastAPI replicas
+
+Nginx changes:
+
+Modify:
+
+nginx/nginx.conf
+
+Add:
+
+- Static frontend root
+- SPA fallback to index.html
+- API routing
+- WebSocket routing
+- WebSocket timeouts
+- Forwarded headers
+- TLS configuration later
+- Optional health-aware upstream behavior
+
+The existing backend routes do not use /api. The safer initial plan is to
+preserve the current API paths and proxy them directly.
+
+Docker changes:
+
+Dockerfile
+docker-compose.yml
+nginx/nginx.conf
+frontend/Dockerfile
+
+Recommended services:
+
+- postgres
+- postgres_backup
+- redis
+- rabbitmq
+- migrations
+- chat_server_1
+- chat_server_2
+- chat_server_3
+- frontend_nginx
+- watchtower
+
+Controlled migration service:
+
+The migrations service should:
+
+- Depend on PostgreSQL health.
+- Run alembic upgrade head once.
+- Exit successfully.
+
+Backend replicas should depend on successful migration completion.
+
+Do not run migrations independently inside every backend replica.
+
+The application image must contain:
+
+- app/
+- alembic/
+- alembic.ini
+- requirements.txt
+
+
+20. Testing Strategy
+--------------------
+
+Backend unit tests:
+
+- Conversation membership authorization
+- Target membership validation
+- Duplicate conversation prevention
+- User search
+- Message serialization
+- Base64 encoding
+- Protocol compatibility
+- Key rotation
+- Idempotency
+- Outbox claiming
+- Retry classification
+
+Recommended files:
+
+tests/test_chat_authorization.py
+tests/test_user_search.py
+tests/test_message_protocol.py
+tests/test_outbox.py
+tests/test_idempotency.py
+
+API integration tests:
+
+- Registration
+- Login
+- Invalid JWT
+- Conversation creation
+- Existing conversation retrieval
+- Unauthorized history access
+- Missed-message retrieval
+- Public-key registration
+- Presence
+- Health endpoints
+
+Use PostgreSQL migrations rather than only Base.metadata.create_all().
+
+WebSocket tests:
+
+- Valid authentication
+- Invalid authentication
+- Conversation membership
+- Invalid payload
+- Ping/pong
+- Message persistence
+- Sender echo
+- Disconnect cleanup
+- Multiple connections for one user
+- Reconnection behavior
+
+Recommended file:
+
+tests/test_websocket.py
+
+RabbitMQ and Redis integration tests:
+
+- RabbitMQ topology
+- Outbox publication
+- Publisher retry
+- Consumer acknowledgement
+- Consumer requeue
+- Dead-letter behavior
+- Atomic idempotency
+- Redis reconnect
+- Cross-instance delivery
+
+Frontend tests:
+
+- Login
+- Registration
+- User search
+- Conversation creation
+- Message display
+- WebSocket reconnect
+- Missed-message replay
+- E2EE compatibility
+- Loading and error states
+- Responsive layout
+
+Recommended tools:
+
+- Vitest
+- React Testing Library
+- Playwright
+
+End-to-end tests should run:
+
+- Frontend
+- Nginx
+- Three FastAPI replicas
+- PostgreSQL
+- Redis
+- RabbitMQ
+- Migration service
+
+Important scenarios:
+
+1. Alice connects to server 1 and Bob connects to server 2.
+2. Alice sends a message.
+3. Bob receives it.
+4. Bob disconnects.
+5. Alice sends another message.
+6. Bob reconnects.
+7. Bob receives the missed message.
+8. One FastAPI replica is stopped.
+9. Clients reconnect.
+10. No duplicate or missing message occurs.
+
+
+21. Dependency-Aware Implementation Roadmap
+--------------------------------------------
+
+Phase 0 - Baseline and safety
+
+Objective:
+
+Create a stable baseline before changing behavior.
+
+Actions:
+
+- Record current API contracts.
+- Record current WebSocket payloads.
+- Record current database schema.
+- Confirm migration behavior.
+- Establish backend and frontend test commands.
+- Ensure no secrets are committed.
+- Document the current protocol.
+
+Suggested documentation files:
+
+docs/current-api-contract.md
+docs/current-message-protocol.md
+docs/current-deployment.md
+
+Phase 1 - Database and protocol corrections
+
+Objective:
+
+Fix schema and data-format inconsistencies before adding features.
+
+Modify:
+
+app/models/outbox_events.py
+app/models/message.py
+app/schemas/message.py
+app/schemas/event.py
+app/api/conversations.py
+app/messaging/rabbitmq/publisher.py
+app/messaging/rabbitmq/consumer.py
+
+Create:
+
+alembic/versions/<corrective_schema_migration>.py
+tests/test_migrations.py
+tests/test_message_protocol.py
+
+Phase 2 - Authorization and conversation correctness
+
+Objective:
+
+Secure all message and history access.
+
+Modify:
+
+app/websocket/chat.py
+app/services/chat_service.py
+app/api/conversations.py
+app/models/conversation.py
+
+Create:
+
+alembic/versions/<conversation_uniqueness_migration>.py
+tests/test_chat_authorization.py
+tests/test_conversation_concurrency.py
+
+Phase 3 - Outbox, RabbitMQ, and Redis reliability
+
+Objective:
+
+Make asynchronous processing reliable across replicas.
+
+Modify:
+
+app/messaging/rabbitmq/publisher.py
+app/messaging/rabbitmq/consumer.py
+app/messaging/rabbitmq/connection.py
+app/messaging/redis_client.py
+app/main.py
+app/models/outbox_events.py
+
+Create:
+
+alembic/versions/<outbox_claiming_migration>.py
+tests/test_outbox.py
+tests/test_idempotency.py
+tests/test_broker_recovery.py
+tests/test_redis_recovery.py
+
+Phase 4 - Offline recovery and WebSocket lifecycle
+
+Objective:
+
+Guarantee practical message recovery after reconnect.
+
+Modify:
+
+app/websocket/chat.py
+app/api/conversations.py
+app/services/chat_service.py
+app/presence/service.py
+client/main.py
+client_bob/main.py
+
+Create:
+
+tests/test_websocket.py
+tests/test_message_recovery.py
+
+Phase 5 - User search and frontend-ready APIs
+
+Objective:
+
+Expose user-friendly APIs without requiring manual IDs.
+
+Create:
+
+app/api/users.py
+app/services/user_service.py
+
+Modify:
+
+app/main.py
+app/schemas/user.py
+app/schemas/conversation.py
+app/services/chat_service.py
+app/api/conversations.py
+
+Create migration if needed:
+
+alembic/versions/<user_search_index_migration>.py
+
+Phase 6 - Browser E2EE compatibility
+
+Objective:
+
+Implement browser encryption without breaking Python clients.
+
+Create:
+
+frontend/src/crypto/e2ee.ts
+frontend/src/crypto/keyStore.ts
+frontend/src/crypto/encoding.ts
+frontend/src/crypto/protocol.ts
+tests/e2ee_vectors/
+
+Modify only if required:
+
+app/api/keys.py
+app/services/key_service.py
+app/schemas/key.py
+
+Phase 7 - React frontend
+
+Objective:
+
+Build the WhatsApp-inspired user interface.
+
+Create the complete frontend directory described in the frontend architecture
+section.
+
+Dependencies:
+
+- User search API
+- Conversation API improvements
+- Message recovery API
+- Browser E2EE compatibility
+
+Phase 8 - Docker and Nginx integration
+
+Objective:
+
+Deploy the complete system using Docker Compose.
+
+Modify:
+
+Dockerfile
+docker-compose.yml
+nginx/nginx.conf
+.github/workflows/build.yml
+
+Create:
+
+frontend/Dockerfile
+docker-compose.test.yml
+
+Phase 9 - End-to-end validation
+
+Objective:
+
+Validate the complete distributed application.
+
+Create:
+
+tests/e2e/
+tests/load/
+playwright.config.ts
+
+Validate:
+
+- Three FastAPI replicas
+- Nginx routing
+- Cross-instance WebSocket delivery
+- Redis failure
+- RabbitMQ failure
+- Backend failure
+- Reconnection
+- Missed-message replay
+- E2EE compatibility
+- Migration startup
+- Frontend deployment
+
+
+22. Recommended Change Order
+----------------------------
+
+1. Fix migrations and message serialization.
+2. Fix authorization.
+3. Fix conversation uniqueness.
+4. Fix outbox concurrency.
+5. Fix Redis and RabbitMQ recovery.
+6. Implement missed-message replay.
+7. Add user search.
+8. Verify browser E2EE compatibility.
+9. Build the React frontend.
+10. Integrate Docker and Nginx.
+11. Add end-to-end and failure tests.
+12. Add TLS and production hardening.
+
+Do not begin frontend development before backend contracts and the E2EE
+protocol are stable.
+
+
+23. Final Recommendation
+------------------------
+
+The existing distributed architecture is suitable and should not be replaced.
+
+The highest-priority work is:
+
+1. Correct message authorization.
+2. Correct migration consistency.
+3. Make outbox publication safe across replicas.
+4. Make idempotency atomic.
+5. Implement offline message replay.
+6. Establish browser-compatible E2EE.
+7. Build the React interface.
+
+Once these foundations are stable, the React application can provide a
+user-friendly WhatsApp-inspired experience without requiring users to
+understand:
+
+- JWTs
+- User IDs
+- Conversation IDs
+- Backend replicas
+- Redis
+- RabbitMQ
+- Encryption internals
