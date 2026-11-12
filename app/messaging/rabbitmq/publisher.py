@@ -2,50 +2,56 @@ import asyncio
 import json
 from datetime import datetime
 import aio_pika
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update  # NEW: import update
+from sqlalchemy import select
 
 from app.core.database import AsyncSessionLocal
 from app.models.outbox_events import OutboxEvent
 from app.messaging.rabbitmq.connection import rabbitmq_manager
 from app.core.config import settings
 
+
+async def publish_outbox_batch(batch_size: int = 100) -> int:
+    """Claim and publish one batch while holding its database transaction."""
+    if rabbitmq_manager.exchange is None:
+        raise RuntimeError("RabbitMQ exchange is not initialized.")
+
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            result = await session.execute(
+                select(OutboxEvent)
+                .where(OutboxEvent.published_at.is_(None))
+                .order_by(OutboxEvent.created_at)
+                .limit(batch_size)
+                .with_for_update(skip_locked=True)
+            )
+            events = result.scalars().all()
+
+            for event in events:
+                message = aio_pika.Message(
+                    body=json.dumps(event.payload).encode("utf-8"),
+                    message_id=str(event.event_id),
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                )
+                # publisher_confirms and on_return_raises are enabled on the
+                # channel, so this await fails for a NACK or unroutable event.
+                await rabbitmq_manager.exchange.publish(
+                    message,
+                    routing_key=event.event_type,
+                    mandatory=True,
+                )
+                event.published_at = datetime.utcnow()
+
+            return len(events)
+
+
 async def process_outbox():
     print(f"[{settings.SERVER_ID}] Starting Outbox Publisher background task...")
     
     while True:
         try:
-            async with AsyncSessionLocal() as session:
-                stmt = select(OutboxEvent).where(OutboxEvent.published_at == None).order_by(OutboxEvent.created_at)
-                result = await session.execute(stmt)
-                events = result.scalars().all()
-
-                published_ids = [] # NEW: Keep track of what we successfully sent
-
-                for event in events:
-                    message = aio_pika.Message(
-                        body=json.dumps(event.payload).encode('utf-8'),
-                        message_id=str(event.event_id),
-                        delivery_mode=aio_pika.DeliveryMode.PERSISTENT 
-                    )
-                    
-                    if rabbitmq_manager.exchange:
-                        await rabbitmq_manager.exchange.publish(message, routing_key=event.event_type)
-                        print(f"[{settings.SERVER_ID}] Published Outbox Event {event.event_id} to RabbitMQ.")
-                        
-                        # Add to our success list instead of modifying the object directly
-                        published_ids.append(event.id) 
-                
-                # NEW: Explicit Bulk Update to the database
-                if published_ids:
-                    update_stmt = (
-                        update(OutboxEvent)
-                        .where(OutboxEvent.id.in_(published_ids))
-                        .values(published_at=datetime.utcnow())
-                    )
-                    await session.execute(update_stmt)
-                    await session.commit()
-                    
+            published_count = await publish_outbox_batch()
+            if published_count:
+                print(f"[{settings.SERVER_ID}] Published {published_count} outbox event(s).")
         except asyncio.CancelledError:
             break
         except Exception as e:

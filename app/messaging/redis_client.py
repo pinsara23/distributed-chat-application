@@ -17,6 +17,7 @@ from app.core.config import settings
 class RedisPubSubManager:
     def __init__(self):
         self.redis_client = None
+        self.redis = None
         self.pubsub = None  # This must exist!
 
     async def connect(self):
@@ -37,17 +38,11 @@ class RedisPubSubManager:
     async def publish_message(self, target_user_id: int, message_payload: dict):
         """Publishes a message payload to a specific user's Redis channel."""
         channel = f"chat:user:{target_user_id}"
-        try:
-            if self.redis_client:
-                await self.redis_client.publish(channel, json.dumps(message_payload))
-                print(f"[{settings.SERVER_ID}] Published event to {channel}")
+        if self.redis_client is None:
+            raise RuntimeError("Redis client is not connected.")
 
-            else:
-                print(f"[{settings.SERVER_ID}] Redis client not connected. Cannot publish message.")
-        except Exception as e:
-            # we catch the error msg 
-            # msg is safly saved in postgres and will be retried later
-            print(f"[{settings.SERVER_ID}] ERROR PUBLISHING MESSAGE: {e}")
+        await self.redis_client.publish(channel, json.dumps(message_payload))
+        print(f"[{settings.SERVER_ID}] Published event to {channel}")
 
     async def subscribe_and_listen(self, local_websocket_manager):
         """Listens for cross-server messages and attempts local delivery."""

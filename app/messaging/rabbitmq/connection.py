@@ -1,4 +1,3 @@
-import asyncio
 import aio_pika
 from app.core.config import settings
 
@@ -12,7 +11,10 @@ class RabbitMqConnectionManager:
         """establish robust connection that auto reconnect when failure"""
         self.connection = await aio_pika.connect_robust(settings.RABBITMQ_URL)
         # channels actas isolated communication sessions over the single tcp channel
-        self.channel = await self.connection.channel()
+        self.channel = await self.connection.channel(
+            publisher_confirms=True,
+            on_return_raises=True,
+        )
         print(f"[{settings.SERVER_ID}] Connected to RabbitMQ.") 
 
     async def setup_topology(self):
