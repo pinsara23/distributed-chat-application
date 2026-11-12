@@ -1,0 +1,2423 @@
+# Distributed Chat System — Stage 4
+
+## Fault Tolerance, Distributed Presence, Recovery and End-to-End Encryption
+
+# 1. Project Context
+
+I am building a **Distributed Chat System** as a distributed-systems learning project.
+
+Stages 1–3 are already complete.
+
+Do NOT rebuild the project from scratch.
+
+Stage 4 must extend my existing Stage 3 codebase.
+
+---
+
+# 2. What Has Already Been Completed
+
+## Stage 1 — Secure Single-Server Chat
+
+Completed:
+
+- FastAPI
+- PostgreSQL
+- SQLAlchemy
+- Alembic
+- JWT authentication
+- secure password hashing
+- authorization
+- one-to-one conversations
+- PostgreSQL message persistence
+- chat history
+- authenticated WebSockets
+- offline messages
+- Docker / Docker Compose
+- pytest
+
+---
+
+## Stage 2 — Distributed Multi-Server Chat
+
+Completed:
+
+- multiple FastAPI instances
+- Nginx load balancing
+- shared PostgreSQL
+- Redis Pub/Sub
+- cross-server WebSocket communication
+- local WebSocket connection managers
+- server IDs
+- distributed logging
+- Dockerized multi-server deployment
+
+Architecture became:
+
+```text
+                    Nginx
+                      │
+          ┌───────────┼───────────┐
+          ▼           ▼           ▼
+       Server 1    Server 2    Server 3
+          │           │           │
+          └───────────┼───────────┘
+                      │
+                Redis Pub/Sub
+                      │
+                 PostgreSQL
+```
+
+---
+
+## Stage 3 — Reliable Distributed Messaging
+
+Completed:
+
+- RabbitMQ
+- exchanges
+- queues
+- producers
+- consumers
+- manual ACK/NACK
+- bounded retries
+- dead-letter queue
+- stable event/message UUIDs
+- idempotent consumers
+- Transactional Outbox Pattern
+- application-level message encryption
+- encrypted message storage
+- failure experiments
+- improved distributed logging
+
+Current conceptual message path:
+
+```text
+Alice
+  │
+  ▼
+FastAPI
+  │
+  ├── Authentication
+  ├── Authorization
+  └── Message processing
+           │
+           ▼
+     PostgreSQL Transaction
+       │              │
+       ▼              ▼
+    Message        Outbox Event
+                       │
+                       ▼
+                Outbox Publisher
+                       │
+                       ▼
+                    RabbitMQ
+                       │
+                       ▼
+                    Consumer
+                       │
+                       ▼
+                     Redis
+                       │
+            ┌──────────┼──────────┐
+            ▼          ▼          ▼
+         Server 1   Server 2   Server 3
+                                  │
+                                  ▼
+                            Bob WebSocket
+```
+
+---
+
+# 3. Stage 4 Main Goal
+
+Stage 4 should make the system more resilient and improve message confidentiality.
+
+The main Stage 4 topics are:
+
+```text
+Distributed Presence
+        +
+Heartbeats
+        +
+Failure Detection
+        +
+WebSocket Reconnection
+        +
+Message Synchronization
+        +
+Recovery
+        +
+Graceful Failure Handling
+        +
+End-to-End Encryption
+```
+
+The system should continue functioning reasonably when individual components temporarily fail.
+
+The system should also move from:
+
+```text
+Server-side encryption
+```
+
+to:
+
+```text
+End-to-End Encryption
+```
+
+for message content.
+
+---
+
+# 4. Target Final Architecture
+
+The final system should approximately look like:
+
+```text
+                         CLIENTS
+                            │
+                            ▼
+                          NGINX
+                            │
+             ┌──────────────┼──────────────┐
+             ▼              ▼              ▼
+          SERVER 1       SERVER 2       SERVER 3
+          FastAPI        FastAPI        FastAPI
+             │              │              │
+             └──────────────┼──────────────┘
+                            │
+          ┌─────────────────┼─────────────────┐
+          │                 │                 │
+          ▼                 ▼                 ▼
+      PostgreSQL          Redis            RabbitMQ
+      Persistent       Presence +          Reliable
+         Data          Real-time           Messaging
+                           │
+                           ▼
+                     TTL / Heartbeats
+```
+
+Client-side message flow should conceptually become:
+
+```text
+Alice Client
+     │
+     │ Encrypt message
+     ▼
+   Ciphertext
+     │
+     ▼
+FastAPI / Distributed Backend
+     │
+     ▼
+PostgreSQL
+     │
+     ▼
+RabbitMQ
+     │
+     ▼
+Redis
+     │
+     ▼
+Bob Client
+     │
+     │ Decrypt message
+     ▼
+"Hello Bob!"
+```
+
+The backend should transport/store ciphertext without needing the conversation plaintext for E2EE messages.
+
+---
+
+# 5. Preserve Stages 1–3
+
+Do not remove existing functionality unless a Stage 4 design explicitly replaces part of it.
+
+Keep:
+
+- authentication
+- JWT
+- password hashing
+- authorization
+- conversations
+- PostgreSQL
+- WebSockets
+- multiple FastAPI servers
+- Nginx
+- Redis
+- RabbitMQ
+- transactional outbox
+- stable event IDs
+- idempotency
+- ACK/NACK
+- retries
+- DLQ
+- Docker Compose
+- tests
+- logging
+
+Stage 4 is an extension.
+
+---
+
+# 6. Part A — Distributed User Presence
+
+Stage 2 kept WebSocket connections locally.
+
+For example:
+
+```text
+Server 1:
+Alice
+
+Server 2:
+Charlie
+
+Server 3:
+Bob
+```
+
+That is still correct.
+
+However, we now want every server to be able to determine whether a user is approximately:
+
+```text
+online
+offline
+```
+
+without sharing Python memory.
+
+Use Redis for distributed presence.
+
+---
+
+# 7. Redis Presence Model
+
+Use Redis keys representing connected users.
+
+For example:
+
+```text
+presence:user:12
+```
+
+Possible value:
+
+```json
+{
+  "server_id": "chat-server-3",
+  "connection_id": "uuid"
+}
+```
+
+The key should have a TTL.
+
+Conceptually:
+
+```text
+presence:user:12
+TTL = 30 seconds
+```
+
+The exact TTL can be configurable.
+
+Do NOT permanently store online status without expiration.
+
+Otherwise a crashed server could leave users appearing online forever.
+
+---
+
+# 8. Why TTL Matters
+
+Suppose Bob is connected to Server 3.
+
+Redis contains:
+
+```text
+presence:user:12 = server-3
+```
+
+Then Server 3 crashes.
+
+It cannot execute:
+
+```text
+delete presence:user:12
+```
+
+because it is dead.
+
+Without TTL:
+
+```text
+Bob = online forever
+```
+
+With TTL:
+
+```text
+Server crashes
+      ↓
+heartbeat stops
+      ↓
+TTL decreases
+      ↓
+key expires
+      ↓
+Bob becomes offline
+```
+
+This is a basic failure-detection mechanism.
+
+---
+
+# 9. Heartbeats
+
+While a WebSocket connection is active, refresh the user's presence TTL periodically.
+
+Conceptually:
+
+```text
+Client connected
+      │
+      ▼
+presence:user:12
+TTL 30 sec
+      │
+      ▼
+heartbeat
+      │
+      ▼
+TTL refreshed
+```
+
+For example:
+
+```text
+Heartbeat interval = 10 seconds
+Presence TTL = 30 seconds
+```
+
+Make values configurable.
+
+Do not hardcode timing throughout the application.
+
+---
+
+# 10. Presence Lifecycle
+
+Expected lifecycle:
+
+## Connect
+
+```text
+WebSocket authenticated
+        ↓
+connection registered locally
+        ↓
+Redis presence created
+```
+
+## Active
+
+```text
+heartbeat
+    ↓
+presence TTL refreshed
+```
+
+## Clean Disconnect
+
+```text
+WebSocket closes
+      ↓
+local connection removed
+      ↓
+presence removed/updated
+```
+
+## Server Crash
+
+```text
+No cleanup possible
+      ↓
+heartbeat stops
+      ↓
+TTL expires
+      ↓
+presence disappears
+```
+
+---
+
+# 11. Multiple Connections Per User
+
+Do not assume a user can only have one connection forever.
+
+A user could eventually have:
+
+```text
+Laptop
+Phone
+Tablet
+```
+
+A simple Stage 4 design may support multiple connections using unique connection IDs.
+
+For example:
+
+```text
+presence:user:12:connection:abc
+presence:user:12:connection:def
+```
+
+or a Redis set plus TTL-aware connection records.
+
+Then:
+
+```text
+User online
+=
+at least one valid connection exists
+```
+
+If full multi-device support creates excessive complexity, implement a clean architecture that supports one active connection now but explain how it would evolve.
+
+---
+
+# 12. Presence API
+
+Add an authenticated presence endpoint if appropriate.
+
+For example:
+
+```text
+GET /users/{user_id}/presence
+```
+
+Possible response:
+
+```json
+{
+  "user_id": 12,
+  "status": "online"
+}
+```
+
+Do not expose internal information unnecessarily.
+
+The client does not need:
+
+```text
+server IP
+Redis key
+internal container name
+```
+
+A server ID may remain internal for logs/debugging.
+
+---
+
+# 13. Presence Events
+
+Optionally publish presence changes such as:
+
+```text
+user.online
+user.offline
+```
+
+through the existing real-time infrastructure.
+
+Do not make presence event handling unnecessarily complicated.
+
+Redis is appropriate for ephemeral presence-related information.
+
+PostgreSQL should not be continuously updated for every heartbeat.
+
+---
+
+# 14. Part B — WebSocket Heartbeat / Liveness
+
+Presence TTL and WebSocket liveness are related but should be understood separately.
+
+Implement an application heartbeat or WebSocket ping/pong strategy appropriate for the selected WebSocket stack.
+
+Purpose:
+
+```text
+Detect dead/stale connection
+        ↓
+clean local state
+        ↓
+stop presence refresh
+```
+
+Do not rely indefinitely on a socket that appears open in memory.
+
+---
+
+# 15. Part C — Client Reconnection
+
+Network connections fail.
+
+Examples:
+
+```text
+Wi-Fi temporarily drops
+Laptop sleeps
+Server restarts
+Nginx reconnect occurs
+Container restarts
+```
+
+The client should reconnect automatically.
+
+Implement a reference/test client that demonstrates this behavior.
+
+Use bounded exponential backoff with jitter conceptually:
+
+```text
+disconnect
+   ↓
+wait
+   ↓
+reconnect attempt
+   ↓
+failure
+   ↓
+wait longer
+   ↓
+reconnect
+```
+
+Do not use an aggressive infinite loop such as:
+
+```text
+while disconnected:
+    reconnect immediately
+```
+
+That can create a reconnection storm.
+
+---
+
+# 16. Reconnection Authentication
+
+Every new WebSocket connection must be authenticated again.
+
+Do not assume:
+
+```text
+This socket used to belong to Alice,
+therefore the new socket is Alice.
+```
+
+The replacement connection must provide valid authentication.
+
+Expired JWTs must be handled appropriately.
+
+---
+
+# 17. Part D — Message Synchronization After Reconnect
+
+Reconnecting a WebSocket is not enough.
+
+Messages may have been created while the client was disconnected.
+
+Therefore implement message synchronization.
+
+Example:
+
+```text
+Bob received message 100
+        ↓
+Bob disconnects
+        ↓
+messages 101, 102, 103 created
+        ↓
+Bob reconnects
+        ↓
+fetch messages after 100
+```
+
+This is an important recovery mechanism.
+
+---
+
+# 18. Synchronization Cursor
+
+Use a stable cursor.
+
+Possible approaches:
+
+```text
+message sequence
+message UUID + ordering information
+created_at + tie-breaker
+database primary key
+```
+
+Prefer an unambiguous ordering mechanism.
+
+For a simple system, a monotonically increasing database message ID can be used for synchronization while UUID remains the globally stable logical identifier.
+
+Example:
+
+```text
+GET /conversations/15/messages?after_id=100
+```
+
+Then return:
+
+```text
+101
+102
+103
+```
+
+Do not rely only on client clocks.
+
+---
+
+# 19. Real-Time + History Must Converge
+
+The application should be correct even if a real-time event is missed.
+
+Important principle:
+
+```text
+WebSocket
+=
+low-latency delivery
+
+PostgreSQL history
+=
+recovery/source of truth
+```
+
+If Bob misses a WebSocket event, synchronization after reconnect should recover the message from PostgreSQL.
+
+---
+
+# 20. Duplicate Recovery
+
+A race can happen:
+
+```text
+Bob reconnects
+      ↓
+fetches missed messages
+      ↓
+same message also arrives over WebSocket
+```
+
+The client should use stable message UUIDs to deduplicate.
+
+Conceptually:
+
+```text
+if message_id already processed:
+    ignore duplicate
+```
+
+This continues the idempotency ideas learned in Stage 3.
+
+---
+
+# 21. Part E — Graceful Server Shutdown
+
+When a FastAPI server intentionally shuts down:
+
+- stop accepting new work
+- cancel/finish background tasks appropriately
+- close RabbitMQ resources
+- close Redis resources
+- close database resources where applicable
+- clean local WebSocket state
+- stop presence heartbeats
+- close WebSockets cleanly where practical
+
+Use FastAPI lifespan management.
+
+Do not simply terminate background tasks without understanding cleanup.
+
+---
+
+# 22. Server Failure
+
+There are two cases.
+
+## Graceful Shutdown
+
+The application knows it is stopping and can clean up.
+
+## Crash
+
+The process suddenly disappears.
+
+It cannot clean up.
+
+Therefore distributed state must not depend entirely on graceful cleanup.
+
+This is why presence uses:
+
+```text
+TTL + heartbeat
+```
+
+instead of only:
+
+```text
+delete key on disconnect
+```
+
+---
+
+# 23. Nginx Failure Handling
+
+Configure Nginx so unhealthy/unavailable backend instances are not continuously treated as usable.
+
+For normal HTTP traffic, requests should be able to reach remaining healthy instances.
+
+Example:
+
+```text
+Server 2 fails
+
+Server 1 ✓
+Server 2 ✗
+Server 3 ✓
+```
+
+New connections should still be able to use available servers.
+
+Existing WebSockets connected to Server 2 will break and clients must reconnect.
+
+Do not claim Nginx can magically migrate an existing TCP/WebSocket connection to another backend.
+
+It cannot.
+
+Recovery happens by reconnecting.
+
+---
+
+# 24. Health Endpoints
+
+Add clear health endpoints.
+
+For example:
+
+```text
+GET /health/live
+GET /health/ready
+```
+
+## Liveness
+
+Answers:
+
+```text
+Is this application process alive?
+```
+
+It should not necessarily fail merely because every external dependency has a temporary problem.
+
+## Readiness
+
+Answers:
+
+```text
+Can this instance currently serve the required workload?
+```
+
+Readiness may consider important dependencies such as PostgreSQL/Redis/RabbitMQ according to the architecture.
+
+Explain the distinction clearly.
+
+---
+
+# 25. Dependency Failure Handling
+
+Test failures of:
+
+```text
+FastAPI instance
+Redis
+RabbitMQ
+PostgreSQL
+```
+
+Do not treat every failure identically.
+
+---
+
+# 26. Redis Failure
+
+Redis currently supports:
+
+```text
+real-time cross-server events
+presence
+```
+
+If Redis temporarily fails:
+
+- presence information may become unavailable/stale
+- real-time delivery may be disrupted
+- durable chat messages should remain protected by PostgreSQL/RabbitMQ/outbox mechanisms
+
+Do not report users as definitely offline merely because Redis is unavailable.
+
+Possible API status:
+
+```text
+unknown
+```
+
+may be more correct than:
+
+```text
+offline
+```
+
+during dependency failure.
+
+---
+
+# 27. RabbitMQ Failure
+
+Stage 3 transactional outbox should help.
+
+If RabbitMQ fails:
+
+```text
+message transaction
+     ↓
+PostgreSQL
+     ↓
+outbox remains pending
+```
+
+When RabbitMQ returns:
+
+```text
+outbox publisher
+      ↓
+publish pending events
+```
+
+Verify this behavior in Stage 4 fault tests.
+
+---
+
+# 28. PostgreSQL Failure
+
+PostgreSQL is the persistent source of truth.
+
+If it is unavailable, operations requiring durable message creation should fail safely.
+
+Do NOT pretend a message was successfully stored when it was not.
+
+Do not silently acknowledge successful message creation if the transaction failed.
+
+---
+
+# 29. Part F — End-to-End Encryption
+
+Stage 3 implemented **server-side application encryption**.
+
+Conceptually:
+
+```text
+Alice
+  │ plaintext
+  ▼
+Server
+  │ encrypt
+  ▼
+Database ciphertext
+```
+
+The server possesses the key.
+
+Therefore the server can decrypt messages.
+
+That is NOT E2EE.
+
+Stage 4 should change the architecture.
+
+---
+
+# 30. E2EE Goal
+
+With end-to-end encryption:
+
+```text
+Alice Device
+     │
+     │ Encrypt locally
+     ▼
+Ciphertext
+     │
+     ▼
+Server
+     │
+     ▼
+Database
+     │
+     ▼
+RabbitMQ
+     │
+     ▼
+Bob Device
+     │
+     │ Decrypt locally
+     ▼
+Plaintext
+```
+
+The backend should not require plaintext to route/store ordinary E2EE chat messages.
+
+---
+
+# 31. Important E2EE Principle
+
+The encryption key required to decrypt conversation content should not simply be a global server-side secret.
+
+Otherwise it is still server-side encryption.
+
+Conceptually:
+
+```text
+Stage 3:
+
+Server has message encryption key
+```
+
+Stage 4:
+
+```text
+Alice endpoint ── cryptographic relationship ── Bob endpoint
+
+Server transports ciphertext
+```
+
+---
+
+# 32. Do Not Invent Cryptography
+
+This requirement is critical.
+
+Do NOT create:
+
+```text
+my_custom_encrypt()
+XOR encryption
+custom Diffie-Hellman protocol
+custom ratchet
+custom cipher
+home-made authentication scheme
+```
+
+Use established cryptographic primitives through maintained libraries.
+
+The educational implementation should clearly state its security scope and limitations.
+
+---
+
+# 33. E2EE Scope for This Project
+
+Do not attempt to recreate the entire Signal Protocol from scratch.
+
+That would massively increase project complexity and security risk.
+
+For this educational Stage 4, implement a **limited, clearly documented E2EE design for one-to-one chat** using established library primitives.
+
+It should demonstrate:
+
+- client-side key generation
+- public-key distribution
+- authenticated key agreement
+- conversation/session key derivation
+- authenticated encryption
+- ciphertext transport
+- client-side decryption
+- key identity verification concept
+- key rotation/versioning concept
+
+It should NOT claim to provide all properties of Signal, WhatsApp, or another production messenger.
+
+---
+
+# 34. Client-Side Key Pairs
+
+Each user/client should generate cryptographic key material on the client side.
+
+Conceptually:
+
+```text
+Alice
+├── private key
+└── public key
+
+Bob
+├── private key
+└── public key
+```
+
+The private key must remain on the client.
+
+The server may store/distribute the public key.
+
+Do not send raw private keys to the server.
+
+---
+
+# 35. Public-Key Directory
+
+The backend may expose authenticated endpoints for public keys.
+
+Conceptually:
+
+```text
+POST /keys/public
+GET /users/{id}/keys
+```
+
+The exact API can differ.
+
+The server stores:
+
+```text
+user_id
+public_key
+key_version
+created_at
+```
+
+The server must NOT store the corresponding plaintext private key.
+
+---
+
+# 36. Key Agreement
+
+Use an established key-agreement primitive supported by the selected cryptographic library.
+
+A modern elliptic-curve Diffie-Hellman construction such as X25519 is appropriate for an educational implementation when correctly used through a trusted library.
+
+Conceptually:
+
+```text
+Alice private key
+      +
+Bob public key
+      ↓
+shared secret
+```
+
+Bob performs:
+
+```text
+Bob private key
+      +
+Alice public key
+      ↓
+same shared secret
+```
+
+The raw shared secret should be passed through an appropriate standard key-derivation function according to the library/design rather than directly treated as arbitrary encryption material.
+
+Do not implement elliptic-curve mathematics manually.
+
+---
+
+# 37. Authenticated Encryption
+
+Use a standard AEAD construction supported by the selected library.
+
+For example:
+
+```text
+AES-GCM
+```
+
+or another suitable established AEAD.
+
+The selected design should provide:
+
+```text
+confidentiality
++
+integrity/authentication
+```
+
+Follow the library's nonce requirements exactly.
+
+Never intentionally reuse a nonce with the same key when prohibited.
+
+---
+
+# 38. E2EE Message Format
+
+The server should handle an encrypted envelope approximately like:
+
+```json
+{
+  "message_id": "uuid",
+  "conversation_id": 15,
+  "sender_id": 7,
+  "key_version": 2,
+  "ciphertext": "...",
+  "nonce": "...",
+  "created_at": "..."
+}
+```
+
+Do not send:
+
+```text
+plaintext
+private key
+shared secret
+```
+
+to the backend.
+
+The exact envelope depends on the selected library and E2EE design.
+
+---
+
+# 39. Associated Data
+
+If the selected AEAD supports associated authenticated data, consider binding important non-secret metadata such as:
+
+```text
+message_id
+conversation_id
+sender identity
+protocol version
+```
+
+to the ciphertext.
+
+Explain why authenticated metadata can help prevent ciphertext being validly moved into an unintended context.
+
+Use one canonical serialization format so both endpoints authenticate exactly the same bytes.
+
+---
+
+# 40. Key Identity Verification
+
+A public-key server creates an important trust issue:
+
+```text
+How does Alice know the key returned for Bob really belongs to Bob?
+```
+
+Do not ignore this.
+
+For this educational project, implement or document a key fingerprint verification mechanism.
+
+Example concept:
+
+```text
+Bob key fingerprint:
+AB12 CD34 EF56 ...
+```
+
+Alice and Bob can compare fingerprints through another trusted channel.
+
+The UI/reference client may expose:
+
+```text
+View security fingerprint
+```
+
+Do not claim that simply downloading a public key from the server completely solves identity authentication.
+
+---
+
+# 41. Key Change Handling
+
+If Bob's public identity key changes unexpectedly, the client should not silently treat that as meaningless.
+
+Possible behavior:
+
+```text
+Security key changed for Bob.
+Verify the new fingerprint before continuing sensitive communication.
+```
+
+For this educational project, at minimum:
+
+- detect key version/change
+- store known peer fingerprint locally
+- surface the change
+- explain the security significance
+
+---
+
+# 42. Key Versioning
+
+Public keys should have versions.
+
+Example:
+
+```text
+user_id = 12
+key_version = 3
+```
+
+Encrypted messages should identify the key/session version required for interpretation.
+
+This helps support future key rotation.
+
+---
+
+# 43. Private Key Storage
+
+Private keys must remain client-side.
+
+For the reference development client, store them in the safest practical local mechanism available to the implementation.
+
+Do not:
+
+```text
+commit private keys to Git
+hardcode private keys
+log private keys
+send private keys to FastAPI
+store them in PostgreSQL as plaintext
+```
+
+Explain that production mobile/desktop applications should use OS-backed secure key storage where available.
+
+---
+
+# 44. Stage 3 Encryption Migration
+
+Stage 3 stored server-encrypted messages.
+
+Stage 4 introduces E2EE.
+
+Do not silently destroy old messages.
+
+Use encryption/protocol versioning.
+
+For example:
+
+```text
+encryption_mode
+```
+
+could conceptually distinguish:
+
+```text
+server_encrypted_v1
+e2ee_v1
+```
+
+or use a protocol/version field appropriate to the existing schema.
+
+Existing Stage 3 messages can continue using the previous authorized server-decryption path while new Stage 4 messages use E2EE.
+
+Explain migration limitations clearly.
+
+---
+
+# 45. Backend Changes for E2EE
+
+The backend should stop expecting message plaintext for new E2EE messages.
+
+Instead of:
+
+```json
+{
+  "content": "Hello Bob!"
+}
+```
+
+the client sends something conceptually like:
+
+```json
+{
+  "ciphertext": "...",
+  "nonce": "...",
+  "key_version": 2
+}
+```
+
+The backend still performs:
+
+- authentication
+- conversation authorization
+- sender validation
+- recipient/conversation validation
+- message ID handling
+- persistence
+- RabbitMQ event creation
+- routing
+- delivery
+
+But it does not need the plaintext.
+
+---
+
+# 46. E2EE and RabbitMQ
+
+RabbitMQ events should carry only the encrypted message information required for delivery.
+
+Conceptually:
+
+```text
+Alice encrypts
+     ↓
+FastAPI receives ciphertext
+     ↓
+PostgreSQL stores ciphertext
+     ↓
+Outbox event
+     ↓
+RabbitMQ
+     ↓
+Consumer
+     ↓
+Redis
+     ↓
+Bob receives ciphertext
+     ↓
+Bob decrypts
+```
+
+RabbitMQ should not require access to encryption keys.
+
+---
+
+# 47. E2EE and PostgreSQL
+
+For Stage 4 E2EE messages, PostgreSQL should store ciphertext.
+
+Inspecting the database should show something like:
+
+```text
+message_id
+conversation_id
+sender_id
+ciphertext
+nonce
+key_version
+created_at
+```
+
+not:
+
+```text
+Hello Bob!
+```
+
+---
+
+# 48. E2EE and Chat History
+
+When Bob retrieves history:
+
+```text
+GET /conversations/{id}/messages
+```
+
+the backend returns encrypted envelopes for E2EE messages.
+
+Bob's client decrypts them locally.
+
+Conceptually:
+
+```text
+PostgreSQL
+    │
+    ▼
+ciphertext
+    │
+    ▼
+FastAPI
+    │
+    ▼
+Bob client
+    │
+    ▼
+decrypt
+    │
+    ▼
+plaintext
+```
+
+---
+
+# 49. Important E2EE Limitations to Document
+
+Do not claim the educational E2EE implementation provides every modern secure-messaging property.
+
+Unless explicitly and correctly implemented, do NOT claim:
+
+```text
+Signal Protocol compatibility
+Double Ratchet
+perfect forward secrecy for every message
+post-compromise security
+sealed sender
+metadata privacy
+anonymous routing
+multi-device Signal-style sessions
+production-grade key transparency
+```
+
+Clearly document what the project actually protects.
+
+Even with E2EE, the backend may still observe metadata such as:
+
+```text
+who is communicating
+when messages are sent
+conversation identifiers
+message sizes
+online status
+```
+
+depending on the design.
+
+---
+
+# 50. Suggested New Project Structure
+
+Extend the existing Stage 3 project.
+
+Possible structure:
+
+```text
+distributed-chat/
+│
+├── app/
+│   ├── main.py
+│   │
+│   ├── api/
+│   │   ├── auth.py
+│   │   ├── users.py
+│   │   ├── conversations.py
+│   │   ├── messages.py
+│   │   ├── presence.py
+│   │   ├── keys.py
+│   │   └── health.py
+│   │
+│   ├── websocket/
+│   │   ├── chat.py
+│   │   ├── connection_manager.py
+│   │   └── heartbeat.py
+│   │
+│   ├── messaging/
+│   │   ├── events.py
+│   │   ├── redis/
+│   │   └── rabbitmq/
+│   │
+│   ├── presence/
+│   │   ├── service.py
+│   │   └── models.py
+│   │
+│   ├── core/
+│   │   ├── config.py
+│   │   ├── database.py
+│   │   └── security.py
+│   │
+│   ├── models/
+│   │   ├── user.py
+│   │   ├── conversation.py
+│   │   ├── message.py
+│   │   ├── public_key.py
+│   │   ├── outbox.py
+│   │   └── processed_event.py
+│   │
+│   ├── schemas/
+│   │   ├── message.py
+│   │   ├── presence.py
+│   │   ├── key.py
+│   │   └── event.py
+│   │
+│   └── services/
+│       ├── chat_service.py
+│       ├── delivery_service.py
+│       └── key_service.py
+│
+├── client/
+│   ├── api_client.py
+│   ├── websocket_client.py
+│   ├── crypto.py
+│   ├── key_store.py
+│   ├── sync.py
+│   └── main.py
+│
+├── nginx/
+│   └── nginx.conf
+│
+├── alembic/
+│
+├── tests/
+│   ├── test_presence.py
+│   ├── test_heartbeat.py
+│   ├── test_recovery.py
+│   ├── test_health.py
+│   ├── test_keys.py
+│   ├── test_e2ee.py
+│   └── test_failover.py
+│
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+├── .env.example
+├── .gitignore
+└── README.md
+```
+
+Adapt this to my actual Stage 3 structure instead of unnecessarily rewriting everything.
+
+---
+
+# 51. Reference Client
+
+Because E2EE must happen at the endpoint, Stage 4 needs more client logic than previous stages.
+
+Create a simple reference Python client if I do not already have one.
+
+It should demonstrate:
+
+- login
+- key generation
+- public-key registration
+- peer public-key retrieval
+- fingerprint display
+- conversation key establishment
+- local encryption
+- sending ciphertext
+- WebSocket receiving
+- local decryption
+- automatic reconnection
+- missed-message synchronization
+- duplicate suppression
+
+It does NOT need a complex GUI.
+
+A CLI client is acceptable and easier for learning.
+
+---
+
+# 52. Docker Compose
+
+Final Docker environment should approximately include:
+
+```text
+nginx
+chat_server_1
+chat_server_2
+chat_server_3
+postgres
+redis
+rabbitmq
+```
+
+The client may run outside Docker for easier interactive testing.
+
+Do not unnecessarily add Kubernetes.
+
+---
+
+# 53. Health Checks
+
+Add Docker health checks where appropriate.
+
+Startup should account for dependencies becoming ready at different times.
+
+Do not assume:
+
+```text
+container started
+=
+service ready
+```
+
+This distinction is important.
+
+---
+
+# 54. Logging
+
+Stage 4 logging should make failure/recovery visible.
+
+Example:
+
+```text
+[server-1] Alice WebSocket connected
+[presence] Alice presence created
+[presence] Alice heartbeat refreshed
+
+[server-3] Bob WebSocket disconnected
+[presence] Bob heartbeat stopped
+
+[client-bob] reconnect attempt 1
+[client-bob] reconnect successful
+[client-bob] synchronizing after message 105
+[client-bob] recovered 3 messages
+```
+
+For E2EE:
+
+```text
+[client-alice] encrypted message UUID
+[server-1] received encrypted envelope UUID
+[server-1] persisted ciphertext
+[server-3] delivered encrypted envelope
+[client-bob] decrypted message UUID
+```
+
+Do NOT log:
+
+- private keys
+- shared secrets
+- derived conversation keys
+- JWTs
+- passwords
+- decrypted message contents unnecessarily
+
+---
+
+# 55. Stage 4 Testing
+
+Preserve all Stage 1–3 tests.
+
+Add Stage 4 tests.
+
+## Presence
+
+Test:
+
+```text
+connect
+→ presence exists
+
+heartbeat
+→ TTL refreshed
+
+disconnect
+→ presence removed
+
+crash/no heartbeat
+→ presence expires
+```
+
+## Reconnection
+
+Test:
+
+```text
+connection lost
+→ retry
+→ reconnect
+```
+
+## Synchronization
+
+Test:
+
+```text
+last message = 100
+
+disconnect
+
+101
+102
+103 created
+
+reconnect
+
+101
+102
+103 recovered
+```
+
+## Deduplication
+
+Deliver message through both:
+
+```text
+history synchronization
++
+WebSocket
+```
+
+Expected:
+
+```text
+one logical message
+```
+
+## Health checks
+
+Test:
+
+```text
+/health/live
+/health/ready
+```
+
+## E2EE
+
+Test:
+
+```text
+Alice plaintext
+      ↓
+encrypt
+      ↓
+ciphertext
+      ↓
+Bob decrypt
+      ↓
+same plaintext
+```
+
+Verify server/database do not need plaintext for new E2EE messages.
+
+Test tampered ciphertext.
+
+Expected:
+
+```text
+decryption/authentication failure
+```
+
+Do not display corrupted plaintext.
+
+## Wrong key
+
+Attempt decryption with the wrong key.
+
+Expected:
+
+```text
+failure
+```
+
+## Key fingerprint
+
+Verify deterministic fingerprint generation for the same public key.
+
+## Key change
+
+Replace a peer key.
+
+Expected:
+
+```text
+key change detected
+```
+
+---
+
+# 56. Fault-Tolerance Experiments
+
+I want to intentionally break components and observe recovery.
+
+## Experiment 1 — Kill One FastAPI Server
+
+Example:
+
+```text
+Server 2 ✗
+Server 1 ✓
+Server 3 ✓
+```
+
+Expected:
+
+- existing Server 2 WebSockets disconnect
+- clients reconnect
+- Nginx sends new connections to available servers
+- missed messages synchronize
+- system continues operating
+
+---
+
+## Experiment 2 — Kill Redis
+
+Expected:
+
+- presence becomes unavailable/uncertain
+- real-time cross-server delivery may be interrupted
+- persistent messages remain in PostgreSQL
+- durable RabbitMQ/outbox processing behaves according to implementation
+- application does not falsely claim successful real-time delivery
+
+Restore Redis and verify recovery.
+
+---
+
+## Experiment 3 — Kill RabbitMQ
+
+Expected:
+
+```text
+message persisted
++
+outbox event remains pending
+```
+
+After RabbitMQ restarts:
+
+```text
+pending outbox
+→ RabbitMQ
+→ consumer
+→ delivery
+```
+
+---
+
+## Experiment 4 — Kill PostgreSQL
+
+Expected:
+
+durable message creation fails safely.
+
+Do not tell the sender:
+
+```text
+Message stored successfully
+```
+
+if PostgreSQL did not commit it.
+
+---
+
+## Experiment 5 — Client Network Disconnect
+
+Expected:
+
+```text
+WebSocket disconnect
+      ↓
+reconnection backoff
+      ↓
+reconnect
+      ↓
+authenticate
+      ↓
+sync missed messages
+```
+
+---
+
+## Experiment 6 — Server Crash Without Cleanup
+
+Expected:
+
+```text
+presence heartbeat stops
+      ↓
+TTL expires
+      ↓
+user eventually considered offline
+```
+
+This proves why TTL is needed.
+
+---
+
+# 57. E2EE Demonstration
+
+Use Alice and Bob.
+
+Alice's client generates keys.
+
+Bob's client generates keys.
+
+They register only the necessary public key material with the backend.
+
+Show fingerprints.
+
+Alice sends:
+
+```text
+Secret hello Bob!
+```
+
+Alice's client encrypts it before transmission.
+
+Inspect:
+
+```text
+FastAPI logs
+RabbitMQ event
+PostgreSQL
+```
+
+The ordinary message payload should remain encrypted.
+
+Bob receives ciphertext.
+
+Bob's client decrypts:
+
+```text
+Secret hello Bob!
+```
+
+Then demonstrate:
+
+```text
+Wrong key
+```
+
+cannot successfully authenticate/decrypt the ciphertext.
+
+Also modify the ciphertext and show authenticated decryption fails.
+
+---
+
+# 58. Full Final Message Flow
+
+At the end of Stage 4 I should understand this entire path.
+
+```text
+ALICE CLIENT
+     │
+     ├── plaintext
+     │
+     ├── peer key/session lookup
+     │
+     └── E2EE encryption
+              │
+              ▼
+          ciphertext
+              │
+              ▼
+            NGINX
+              │
+              ▼
+       FASTAPI SERVER 1
+              │
+       Authentication
+       Authorization
+              │
+              ▼
+       PostgreSQL Transaction
+        │                │
+        ▼                ▼
+Encrypted Message    Outbox Event
+                         │
+                         ▼
+                  Outbox Publisher
+                         │
+                         ▼
+                      RabbitMQ
+                         │
+                         ▼
+                      Consumer
+                         │
+                         ▼
+                       Redis
+                         │
+             ┌───────────┼───────────┐
+             ▼           ▼           ▼
+          Server 1    Server 2    Server 3
+                                      │
+                                      ▼
+                                Bob WebSocket
+                                      │
+                                      ▼
+                                  ciphertext
+                                      │
+                                      ▼
+                                  BOB CLIENT
+                                      │
+                                      ▼
+                                    decrypt
+                                      │
+                                      ▼
+                               plaintext message
+```
+
+---
+
+# 59. Final Technology Responsibilities
+
+I should be able to explain this clearly during a project presentation.
+
+## Nginx
+
+```text
+Load balancing
+Reverse proxy
+WebSocket proxying
+```
+
+## FastAPI
+
+```text
+Authentication
+Authorization
+API
+WebSocket handling
+Message validation/routing
+```
+
+## PostgreSQL
+
+```text
+Users
+Conversations
+Encrypted messages
+Public-key metadata
+Outbox events
+Processed-event information
+Persistent source of truth
+```
+
+## Redis
+
+```text
+Fast cross-server communication
+Distributed presence
+TTL-based ephemeral state
+```
+
+## RabbitMQ
+
+```text
+Durable asynchronous processing
+Queues
+ACK/NACK
+Retries
+DLQ
+```
+
+## Transactional Outbox
+
+```text
+Coordinates database state changes with eventual broker publication
+```
+
+## WebSocket
+
+```text
+Real-time client communication
+```
+
+## E2EE Client
+
+```text
+Private key ownership
+Encryption
+Decryption
+Peer-key verification
+```
+
+---
+
+# 60. Important Distributed Systems Concepts Learned Across All Four Stages
+
+By finishing Stage 4, I should understand:
+
+### Horizontal Scaling
+
+Multiple application instances.
+
+### Load Balancing
+
+Traffic distributed between servers.
+
+### Shared Persistent State
+
+PostgreSQL shared by application instances.
+
+### Local State
+
+WebSocket connection belongs to one process/server.
+
+### Pub/Sub
+
+Fast cross-server notification.
+
+### Message Broker
+
+Reliable asynchronous work distribution.
+
+### ACK/NACK
+
+Processing acknowledgement.
+
+### At-Least-Once Processing
+
+Events may be redelivered.
+
+### Idempotency
+
+Duplicate events should not cause duplicate business effects.
+
+### Retry
+
+Temporary failures can recover.
+
+### Dead-Letter Queue
+
+Repeatedly failing events are isolated.
+
+### Dual-Write Problem
+
+Database and broker cannot naively be treated as one atomic operation.
+
+### Transactional Outbox
+
+Persistent event publication bridge.
+
+### Heartbeats
+
+Repeated liveness indication.
+
+### TTL
+
+Automatically expires stale distributed state.
+
+### Presence
+
+Distributed ephemeral user state.
+
+### Failure Detection
+
+Determining that connections/services may no longer be available.
+
+### Reconnection
+
+Recovering network sessions.
+
+### Synchronization
+
+Recovering messages missed during disconnection.
+
+### Eventual Consistency
+
+Different parts of the system may temporarily have different views but converge.
+
+### Fault Tolerance
+
+Continuing/recovering when individual components fail.
+
+### Server-Side Encryption
+
+Server controls decryption.
+
+### End-to-End Encryption
+
+Endpoints control message confidentiality.
+
+---
+
+# 61. What NOT to Add
+
+Do not expand this project unnecessarily.
+
+Do NOT add:
+
+```text
+Kubernetes
+Kafka
+Cassandra
+Elasticsearch
+service mesh
+Raft
+Paxos
+custom blockchain
+custom encryption algorithms
+Signal Protocol reimplementation
+complex microservices
+multi-region deployment
+AI features
+video calling
+voice calling
+file sharing
+```
+
+unless they are separately requested later.
+
+The objective is to finish the distributed-chat architecture cleanly.
+
+---
+
+# 62. Stage 4 Completion Criteria
+
+Stage 4 is complete when:
+
+- Stage 1–3 features continue working.
+- Redis-based distributed presence exists.
+- Presence uses TTL.
+- Presence is refreshed through heartbeat/liveness mechanisms.
+- Crashed servers do not leave permanent online status.
+- WebSocket dead connections are detected.
+- Reference client reconnects automatically.
+- Reconnection uses reasonable backoff.
+- Reconnected clients authenticate again.
+- Missed messages are synchronized.
+- Synchronization has a stable cursor.
+- Duplicate recovery is handled using stable message IDs.
+- Graceful shutdown cleans up resources.
+- Nginx continues serving new traffic when one FastAPI instance fails.
+- Liveness and readiness endpoints exist.
+- Redis failure is handled safely.
+- RabbitMQ/outbox recovery still works.
+- PostgreSQL failure does not produce false success.
+- One-to-one E2EE is implemented using maintained cryptographic primitives/libraries.
+- Private keys remain client-side.
+- Backend stores/distributes public key material only as designed.
+- Peer fingerprints can be inspected.
+- Unexpected key changes are detectable.
+- E2EE messages are encrypted before reaching FastAPI.
+- PostgreSQL stores ciphertext for E2EE messages.
+- RabbitMQ transports ciphertext.
+- Redis transports ciphertext.
+- receiving client decrypts locally.
+- tampered ciphertext fails authentication.
+- wrong-key decryption fails.
+- Stage 3 server-encrypted messages can be handled/migrated appropriately.
+- Tests cover presence, recovery, failover and E2EE.
+- Failure experiments have been performed.
+- README explains the complete architecture.
+- I understand the complete message lifecycle.
+
+---
+
+# 63. Recommended Implementation Order
+
+Do NOT give me the whole repository immediately.
+
+Build Stage 4 step by step.
+
+Use approximately this order:
+
+```text
+Step 1
+Review Stage 3 architecture and prepare Stage 4
+
+Step 2
+Implement Redis presence model
+
+Step 3
+Add TTL and heartbeat refresh
+
+Step 4
+Handle clean disconnect and stale presence
+
+Step 5
+Add WebSocket liveness handling
+
+Step 6
+Build automatic client reconnection
+
+Step 7
+Implement missed-message synchronization
+
+Step 8
+Add client-side deduplication
+
+Step 9
+Add liveness/readiness health endpoints
+
+Step 10
+Improve graceful shutdown
+
+Step 11
+Test FastAPI server failure and Nginx failover
+
+Step 12
+Test Redis/RabbitMQ/PostgreSQL failures
+
+Step 13
+Design the limited educational E2EE protocol
+
+Step 14
+Implement client-side key generation
+
+Step 15
+Implement public-key registration/retrieval
+
+Step 16
+Implement peer fingerprint verification
+
+Step 17
+Implement established key agreement + key derivation
+
+Step 18
+Implement authenticated client-side encryption
+
+Step 19
+Change message API to transport E2EE envelopes
+
+Step 20
+Integrate E2EE with PostgreSQL/outbox/RabbitMQ/Redis
+
+Step 21
+Implement client-side decryption
+
+Step 22
+Add key-version/change handling
+
+Step 23
+Add E2EE tests
+
+Step 24
+Run complete failure experiments
+
+Step 25
+Run Alice/Bob final distributed E2EE demo
+
+Step 26
+Finalize tests, Docker Compose and README
+```
+
+---
+
+# 64. How I Want Another AI to Help Me
+
+For EACH step:
+
+1. Explain what problem we are solving.
+2. Explain the distributed-systems concept.
+3. Inspect/consider my existing Stage 3 architecture before changing it.
+4. Tell me which existing files need modification.
+5. Tell me which new files to create.
+6. Give complete code for every modified/new file.
+7. Explain important code sections.
+8. Give installation commands.
+9. Give Docker commands.
+10. Give Alembic commands if database changes are needed.
+11. Give exact testing commands.
+12. Tell me what output/logs I should expect.
+13. Explain common errors and fixes.
+14. Wait until I confirm the step works before moving to the next step.
+
+Do NOT jump ahead.
+
+Do NOT replace working Stage 1–3 components without a reason.
+
+When Stage 4 is finished, provide:
+
+- final project tree
+- final architecture diagram
+- complete Alice → Bob message walkthrough
+- component responsibility explanation
+- failure/recovery walkthrough
+- E2EE trust-model explanation
+- security limitations
+- distributed-systems concepts demonstrated
+- final demo procedure
+- suggestions for presenting the project
+
+The final result should be understandable enough that I can explain **why every major component exists**, not just run code generated by an AI.

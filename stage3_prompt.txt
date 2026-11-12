@@ -1,0 +1,2054 @@
+# Distributed Chat System — Stage 3
+
+## Reliable Distributed Messaging with RabbitMQ, ACKs, Retries, Idempotency and Message Encryption
+
+## 1. Project Context
+
+I am building a **Distributed Chat System** as a distributed-systems learning project.
+
+The project has four stages:
+
+### Stage 1 — Secure Single-Server Chat
+Completed features:
+
+- FastAPI
+- PostgreSQL
+- SQLAlchemy
+- Alembic
+- JWT authentication
+- Secure password hashing
+- One-to-one conversations
+- PostgreSQL message persistence
+- Authenticated WebSockets
+- Offline message history
+- Docker / Docker Compose
+- pytest
+
+### Stage 2 — Multi-Server Distributed Chat
+Completed features:
+
+- Multiple FastAPI chat server instances
+- Shared PostgreSQL
+- Redis Pub/Sub
+- Cross-server WebSocket messaging
+- Local WebSocket connection managers
+- Nginx load balancing
+- Server IDs
+- Dockerized multi-server environment
+- Distributed logging
+- Cross-server communication
+
+Current architecture is approximately:
+
+```text
+                       Clients
+                          │
+                          ▼
+                       Nginx
+                          │
+             ┌────────────┼────────────┐
+             ▼            ▼            ▼
+          Server 1     Server 2     Server 3
+          FastAPI      FastAPI      FastAPI
+             │            │            │
+             ├────────────┼────────────┤
+             │            │            │
+             ▼            ▼            ▼
+                    Redis Pub/Sub
+                          │
+                     PostgreSQL
+```
+
+More accurately, every FastAPI server connects independently to Redis and PostgreSQL.
+
+### Stage 3 — CURRENT STAGE
+
+Stage 3 should introduce:
+
+- RabbitMQ
+- Durable asynchronous message/event processing
+- Producer/consumer architecture
+- Manual acknowledgements
+- Retry mechanisms
+- Dead-letter handling
+- Message IDs
+- Idempotent processing / duplicate prevention
+- Delivery-state concepts
+- Application-level message encryption
+- Better failure handling
+
+### Stage 4 — Future
+
+Do NOT implement Stage 4 yet.
+
+Stage 4 will introduce:
+
+- Distributed presence
+- Heartbeats
+- Failure detection
+- automatic reconnection/recovery
+- stronger fault tolerance
+- end-to-end encryption
+- key management
+
+---
+
+# 2. Main Goal of Stage 3
+
+Stage 2 solved this problem:
+
+```text
+Alice → Server 1
+
+Bob → Server 3
+```
+
+Server 1 could notify Server 3 using Redis Pub/Sub.
+
+However, Redis Pub/Sub is primarily a real-time notification mechanism.
+
+Suppose:
+
+```text
+Server 3 goes offline
+```
+
+and an event is published while it is unavailable.
+
+The event may not be available later for Server 3 to consume.
+
+Stage 3 should introduce **RabbitMQ as a durable message broker** for asynchronous processing.
+
+The important conceptual change is:
+
+```text
+Stage 2:
+
+Publisher
+   │
+   ▼
+Redis Pub/Sub
+   │
+   ▼
+Active subscribers
+```
+
+Stage 3:
+
+```text
+Producer
+   │
+   ▼
+RabbitMQ Exchange
+   │
+   ▼
+Queue
+   │
+   ▼
+Consumer
+   │
+   ▼
+ACK
+```
+
+The message broker can retain queued work until a consumer processes it successfully.
+
+---
+
+# 3. Stage 3 Architecture
+
+Target architecture:
+
+```text
+                         Clients
+                            │
+                            ▼
+                         Nginx
+                            │
+               ┌────────────┼────────────┐
+               ▼            ▼            ▼
+            Server 1     Server 2     Server 3
+            FastAPI      FastAPI      FastAPI
+               │            │            │
+               └────────────┼────────────┘
+                            │
+                  ┌─────────┼─────────┐
+                  ▼         ▼         ▼
+              PostgreSQL  Redis    RabbitMQ
+```
+
+Responsibilities:
+
+```text
+PostgreSQL
+    ↓
+Persistent application data
+Users
+Conversations
+Messages
+Delivery metadata
+
+Redis
+    ↓
+Fast ephemeral communication
+Stage 2 real-time mechanisms
+Later presence-related functionality
+
+RabbitMQ
+    ↓
+Reliable asynchronous event processing
+Queues
+ACKs
+Retries
+Dead-letter handling
+```
+
+Do not blindly replace every Redis feature with RabbitMQ.
+
+The implementation should clearly explain which communication path uses Redis and which uses RabbitMQ.
+
+---
+
+# 4. Technologies
+
+Continue using:
+
+- Python
+- FastAPI
+- Uvicorn
+- PostgreSQL
+- SQLAlchemy
+- Alembic
+- Pydantic
+- JWT
+- WebSockets
+- Redis
+- Nginx
+- Docker
+- Docker Compose
+- pytest
+
+Add:
+
+- RabbitMQ
+- `aio-pika` or another suitable maintained asynchronous RabbitMQ client
+- authenticated encryption using a well-established cryptographic library
+
+Do NOT implement custom cryptographic algorithms.
+
+---
+
+# 5. Preserve Everything from Stages 1 and 2
+
+Stage 3 is an extension.
+
+Do not rebuild the application from scratch.
+
+These features must continue working:
+
+```text
+Registration
+Login
+JWT authentication
+Password hashing
+Authorization
+Conversation membership checks
+One-to-one conversations
+Message persistence
+Chat history
+Pagination
+Authenticated WebSockets
+Offline message retrieval
+Multiple FastAPI instances
+Nginx load balancing
+Shared PostgreSQL
+Redis
+Cross-server communication
+Docker Compose
+Tests
+```
+
+Refactor components only where necessary for the Stage 3 architecture.
+
+---
+
+# 6. RabbitMQ Concepts I Need to Learn
+
+Do not only provide code.
+
+Explain:
+
+### Producer
+
+A component that sends an event/message to RabbitMQ.
+
+### Exchange
+
+Receives messages from producers and routes them.
+
+### Queue
+
+Stores messages waiting for consumers.
+
+### Binding
+
+Connects an exchange to a queue using routing rules.
+
+### Routing Key
+
+Information used to determine where an event should go.
+
+### Consumer
+
+Receives and processes queued messages.
+
+### ACK
+
+Tells RabbitMQ:
+
+```text
+I processed this successfully.
+```
+
+RabbitMQ can then remove the message from the queue.
+
+### NACK
+
+Indicates that processing failed.
+
+Depending on configuration, the message can be requeued or routed elsewhere.
+
+### Durable Queue
+
+Queue metadata can survive broker restart when configured appropriately.
+
+### Persistent Message
+
+A message published using persistent delivery semantics.
+
+Explain that durable queues + persistent messages improve durability but are not the same thing as mathematically guaranteeing that no failure can ever lose data.
+
+### Prefetch
+
+Controls how many unacknowledged messages a consumer receives simultaneously.
+
+### Dead-Letter Exchange / Queue
+
+Stores or routes messages that repeatedly fail processing.
+
+---
+
+# 7. Recommended Messaging Architecture
+
+Use an exchange rather than publishing directly to arbitrary queues.
+
+Conceptually:
+
+```text
+FastAPI
+   │
+   │ publish
+   ▼
+┌────────────────────┐
+│   chat.events      │
+│     Exchange       │
+└─────────┬──────────┘
+          │
+       routing
+          │
+          ▼
+┌────────────────────┐
+│ Processing Queue   │
+└─────────┬──────────┘
+          │
+          ▼
+      Consumer
+```
+
+Possible event types:
+
+```text
+message.created
+message.delivery
+message.failed
+```
+
+Keep the first implementation understandable.
+
+Do not create dozens of exchanges/queues unnecessarily.
+
+---
+
+# 8. Message IDs
+
+Every chat message should have a unique stable identifier.
+
+A UUID is recommended.
+
+For example:
+
+```text
+550e8400-e29b-41d4-a716-446655440000
+```
+
+Conceptually:
+
+```python
+message_id = UUID(...)
+```
+
+The ID must remain the same even if an event is retried.
+
+Do NOT generate a new ID every time the same logical event is retried.
+
+This is essential for duplicate detection.
+
+---
+
+# 9. Why Duplicate Messages Can Happen
+
+RabbitMQ commonly provides **at-least-once-style processing patterns** when manual acknowledgements and redelivery are used.
+
+Example:
+
+```text
+RabbitMQ
+   │
+   ▼
+Consumer
+   │
+   ├── Processes message
+   │
+   ├── Writes result
+   │
+   └── CRASHES BEFORE ACK
+```
+
+RabbitMQ did not receive the ACK.
+
+Therefore the event may be delivered again.
+
+Without protection:
+
+```text
+Bob receives:
+Hello
+Hello
+```
+
+This is why Stage 3 must introduce **idempotent processing**.
+
+---
+
+# 10. Idempotency
+
+The system must safely handle duplicate delivery attempts.
+
+Conceptually:
+
+```text
+Receive event
+     │
+     ▼
+Check message/event ID
+     │
+     ├── Already processed
+     │       ↓
+     │    Do not process twice
+     │
+     └── New
+             ↓
+          Process
+```
+
+Use PostgreSQL constraints and/or a processed-events table where appropriate.
+
+Possible table:
+
+```text
+processed_events
+
+id
+event_id UNIQUE
+event_type
+processed_at
+```
+
+However, do not add unnecessary tables if an existing unique message identifier can provide the required idempotency.
+
+The implementation should explain the selected approach.
+
+---
+
+# 11. Event Envelope
+
+Define a consistent event structure.
+
+Example:
+
+```json
+{
+  "event_id": "uuid",
+  "event_type": "message.created",
+  "version": 1,
+  "occurred_at": "...",
+  "producer": "chat-server-1",
+  "payload": {
+    "message_id": "uuid",
+    "conversation_id": 15,
+    "sender_id": 7,
+    "recipient_id": 12
+  }
+}
+```
+
+Use Pydantic models to validate events.
+
+Avoid sending:
+
+```text
+passwords
+JWT tokens
+secret keys
+database credentials
+```
+
+through RabbitMQ.
+
+---
+
+# 12. PostgreSQL Remains the Source of Truth
+
+RabbitMQ must NOT replace PostgreSQL.
+
+The architecture should maintain this distinction:
+
+```text
+PostgreSQL
+    =
+Persistent chat data
+
+RabbitMQ
+    =
+Reliable asynchronous event transport/processing
+```
+
+Chat messages must remain queryable from PostgreSQL.
+
+Users who reconnect should be able to retrieve message history regardless of whether they received the real-time WebSocket event.
+
+---
+
+# 13. Recommended Message Send Flow
+
+When Alice sends:
+
+```text
+Hello Bob!
+```
+
+the flow should conceptually become:
+
+```text
+Alice
+  │
+  ▼
+FastAPI Server 1
+  │
+  ├── Authenticate Alice
+  ├── Validate payload
+  ├── Check conversation membership
+  ├── Create unique message ID
+  │
+  ▼
+PostgreSQL
+  │
+  │ Persist message
+  ▼
+RabbitMQ
+  │
+  │ Publish message.created event
+  ▼
+Queue
+  │
+  ▼
+Consumer
+  │
+  ├── Validate event
+  ├── Check duplicate/idempotency
+  ├── Process event
+  ├── Trigger real-time delivery mechanism
+  └── ACK
+```
+
+The exact interaction with Redis/WebSocket delivery should be designed clearly.
+
+---
+
+# 14. RabbitMQ + Redis Together
+
+Stage 2 already uses Redis for communication between WebSocket-owning FastAPI instances.
+
+A reasonable Stage 3 architecture is:
+
+```text
+Alice
+  │
+  ▼
+Server 1
+  │
+  ├── PostgreSQL
+  │
+  └── RabbitMQ
+          │
+          ▼
+       Consumer
+          │
+          ▼
+        Redis
+          │
+    ┌─────┼─────┐
+    ▼     ▼     ▼
+ Server1 Server2 Server3
+                  │
+                  ▼
+                 Bob
+```
+
+RabbitMQ provides reliable asynchronous processing.
+
+Redis remains useful for fast fan-out to whichever FastAPI server currently owns Bob's WebSocket.
+
+Therefore:
+
+```text
+RabbitMQ = reliable queued processing
+
+Redis = fast real-time server notification
+
+PostgreSQL = persistent application state
+
+WebSocket = final live client delivery
+```
+
+This is a useful architecture for learning because each technology has a clear role.
+
+Do not use RabbitMQ merely because it exists; explain why each communication layer is needed.
+
+---
+
+# 15. ACK Strategy
+
+Use manual acknowledgements where appropriate.
+
+Conceptually:
+
+```text
+Consumer receives event
+        ↓
+Validate
+        ↓
+Check idempotency
+        ↓
+Process
+        ↓
+Complete required DB/Redis work
+        ↓
+ACK
+```
+
+Do NOT ACK before important processing has completed.
+
+Otherwise:
+
+```text
+ACK
+ ↓
+Consumer crashes
+ ↓
+Work never completed
+```
+
+and RabbitMQ believes processing succeeded.
+
+---
+
+# 16. Failure Classification
+
+Not every error should be retried.
+
+Distinguish:
+
+### Temporary / Transient Failure
+
+Examples:
+
+```text
+Redis temporarily unavailable
+temporary network error
+temporary dependency failure
+```
+
+These may be retryable.
+
+### Permanent Failure
+
+Examples:
+
+```text
+invalid event schema
+unsupported event version
+malformed payload
+impossible/invalid identifiers
+```
+
+Retrying indefinitely will not fix them.
+
+These should eventually be rejected/dead-lettered.
+
+---
+
+# 17. Retry Mechanism
+
+Do NOT implement an infinite immediate retry loop.
+
+Bad design:
+
+```text
+Fail
+ ↓
+Requeue
+ ↓
+Fail
+ ↓
+Requeue
+ ↓
+Fail
+ ↓
+...
+```
+
+This can create a poison-message loop.
+
+Use a bounded retry strategy.
+
+Conceptually:
+
+```text
+Main Queue
+    │
+    ▼
+Consumer
+    │
+   FAIL
+    │
+    ▼
+Retry mechanism
+    │
+   delay
+    │
+    ▼
+Main Queue
+```
+
+After a configured maximum number of attempts:
+
+```text
+Main Queue
+   │
+ repeated failure
+   ▼
+Dead-Letter Queue
+```
+
+A simple Stage 3 implementation can use RabbitMQ TTL/dead-letter routing for delayed retries.
+
+Keep the design understandable.
+
+---
+
+# 18. Dead-Letter Queue
+
+Add a dead-letter queue for events that cannot be successfully processed.
+
+Conceptually:
+
+```text
+chat.events
+     │
+     ▼
+chat.message.queue
+     │
+     ▼
+Consumer
+     │
+     ├── success → ACK
+     │
+     └── repeated failure
+                │
+                ▼
+          chat.message.dlq
+```
+
+Dead-lettered events should be visible for debugging.
+
+Log:
+
+```text
+event_id
+event_type
+failure reason/category
+attempt information
+timestamp
+server/consumer identifier
+```
+
+Do not log secret data.
+
+---
+
+# 19. Delivery State
+
+Introduce a simple delivery-state model if it fits the existing database design.
+
+For example:
+
+```text
+stored
+queued
+delivered
+failed
+```
+
+Do not overcomplicate this into read receipts unless specifically needed.
+
+Understand the difference:
+
+```text
+stored
+```
+
+means PostgreSQL accepted the message.
+
+```text
+queued
+```
+
+means asynchronous processing has been scheduled.
+
+```text
+delivered
+```
+
+should only be used according to a clearly defined event in the implementation.
+
+For example, server-side WebSocket write success is not necessarily proof that a human actually read the message.
+
+Do not call something "read" without a client-generated read acknowledgement.
+
+---
+
+# 20. Application-Level Encryption
+
+Stage 3 should introduce **application-level encryption for stored message content**.
+
+This is NOT yet full end-to-end encryption.
+
+Stage 4 will handle E2EE/key management.
+
+For Stage 3, the server may encrypt message content before storing it.
+
+Conceptually:
+
+```text
+Alice plaintext
+      │
+      ▼
+FastAPI
+      │
+      ▼
+Encrypt
+      │
+      ▼
+PostgreSQL
+
+ciphertext stored
+```
+
+When authorized application logic needs the message:
+
+```text
+PostgreSQL ciphertext
+      │
+      ▼
+FastAPI
+      │
+      ▼
+Decrypt
+      │
+      ▼
+authorized response/delivery
+```
+
+---
+
+# 21. Use Authenticated Encryption
+
+Use a well-established authenticated-encryption construction from a maintained cryptographic library.
+
+For example, an AEAD such as:
+
+```text
+AES-GCM
+```
+
+may be used through a standard library implementation.
+
+Do NOT manually implement:
+
+```text
+AES
+GCM
+padding
+MAC
+key derivation
+```
+
+Do NOT invent encryption.
+
+Use the cryptographic library correctly.
+
+Each encrypted message should use the nonce/IV requirements specified by the selected AEAD API.
+
+Never intentionally reuse a nonce with the same key where the algorithm forbids it.
+
+---
+
+# 22. Encryption Key Management for Stage 3
+
+Because this is not E2EE yet, Stage 3 may use a server-managed application encryption key.
+
+The key must NOT be:
+
+```text
+hardcoded in Python
+stored in Git
+stored beside ciphertext in the database
+printed in logs
+```
+
+For the development environment, load it securely through environment configuration.
+
+Example concept:
+
+```text
+MESSAGE_ENCRYPTION_KEY=<secret>
+```
+
+Provide only a placeholder in:
+
+```text
+.env.example
+```
+
+The real `.env` must remain ignored by Git.
+
+Explain that production systems should normally use proper secret-management/key-management infrastructure.
+
+Full user-controlled E2EE key management belongs to Stage 4.
+
+---
+
+# 23. Database Changes for Encryption
+
+The existing Stage 2 message table may currently contain:
+
+```text
+content
+```
+
+Stage 3 may migrate toward something such as:
+
+```text
+id
+message_uuid
+conversation_id
+sender_id
+ciphertext
+nonce
+encryption_version
+created_at
+delivery_status
+```
+
+Exact column design can vary depending on the cryptographic API.
+
+Use Alembic migrations.
+
+Do not destroy existing database structure manually.
+
+If existing Stage 2 plaintext data must be migrated, explain a safe development migration strategy.
+
+---
+
+# 24. Encryption Versioning
+
+Include an encryption format/version field.
+
+For example:
+
+```text
+encryption_version = 1
+```
+
+This makes future migration possible.
+
+Avoid assuming one encryption format will exist forever.
+
+---
+
+# 25. Encryption Boundary
+
+Clearly understand what Stage 3 encryption protects.
+
+It can protect stored message content if someone obtains only a database dump without the application key.
+
+However, because the server possesses the decryption key:
+
+```text
+Server can decrypt messages.
+```
+
+Therefore this is **NOT end-to-end encryption**.
+
+Stage 4 E2EE should change the trust model so that message plaintext is intended to be available only at authorized endpoints, not ordinary server-side processing.
+
+Do not incorrectly describe Stage 3 as E2EE.
+
+---
+
+# 26. RabbitMQ Security
+
+RabbitMQ must not use unsafe default production assumptions.
+
+For the development Docker environment:
+
+- configure explicit RabbitMQ credentials
+- keep credentials in environment configuration
+- do not expose unnecessary broker ports publicly
+- use internal Docker networking where possible
+
+RabbitMQ's management interface may be exposed locally for learning/debugging.
+
+Do not commit real credentials.
+
+---
+
+# 27. RabbitMQ Management Interface
+
+For development, enable RabbitMQ's management interface.
+
+This will help me visually inspect:
+
+```text
+Exchanges
+Queues
+Bindings
+Consumers
+Message rates
+Unacknowledged messages
+Dead-letter queues
+```
+
+I want to understand what RabbitMQ is doing rather than treating it as a black box.
+
+---
+
+# 28. Producer Service
+
+Create a clean RabbitMQ producer abstraction.
+
+For example:
+
+```text
+app/
+└── messaging/
+    └── rabbitmq/
+        └── publisher.py
+```
+
+Possible responsibilities:
+
+```text
+connect
+declare topology
+publish event
+close connection
+```
+
+Use robust/reconnecting connections if supported appropriately by the chosen library.
+
+Do not create a completely new TCP connection for every single chat message.
+
+---
+
+# 29. Consumer Service
+
+Create a separate consumer abstraction.
+
+For example:
+
+```text
+app/
+└── messaging/
+    └── rabbitmq/
+        └── consumer.py
+```
+
+Responsibilities:
+
+```text
+consume
+deserialize
+validate
+check idempotency
+process
+ACK
+NACK/reject
+retry
+dead-letter
+```
+
+Keep business logic separated from broker-specific code where practical.
+
+---
+
+# 30. Event Handler
+
+RabbitMQ consumer code should not contain all chat business logic directly.
+
+Prefer:
+
+```text
+RabbitMQ Consumer
+        │
+        ▼
+Event Handler
+        │
+        ▼
+Chat/Delivery Service
+```
+
+This separation will make the system easier to test.
+
+---
+
+# 31. Suggested Project Structure
+
+Extend the completed Stage 2 project.
+
+Possible structure:
+
+```text
+distributed-chat/
+│
+├── app/
+│   ├── main.py
+│   │
+│   ├── api/
+│   │   ├── auth.py
+│   │   ├── users.py
+│   │   ├── conversations.py
+│   │   └── messages.py
+│   │
+│   ├── websocket/
+│   │   ├── chat.py
+│   │   └── connection_manager.py
+│   │
+│   ├── messaging/
+│   │   ├── events.py
+│   │   │
+│   │   ├── redis/
+│   │   │   ├── client.py
+│   │   │   ├── publisher.py
+│   │   │   └── subscriber.py
+│   │   │
+│   │   └── rabbitmq/
+│   │       ├── connection.py
+│   │       ├── topology.py
+│   │       ├── publisher.py
+│   │       ├── consumer.py
+│   │       └── handlers.py
+│   │
+│   ├── core/
+│   │   ├── config.py
+│   │   ├── database.py
+│   │   ├── security.py
+│   │   └── encryption.py
+│   │
+│   ├── models/
+│   │   ├── user.py
+│   │   ├── conversation.py
+│   │   ├── message.py
+│   │   └── processed_event.py
+│   │
+│   ├── schemas/
+│   │   ├── auth.py
+│   │   ├── user.py
+│   │   ├── conversation.py
+│   │   ├── message.py
+│   │   └── event.py
+│   │
+│   └── services/
+│       ├── auth_service.py
+│       ├── chat_service.py
+│       ├── message_service.py
+│       └── delivery_service.py
+│
+├── alembic/
+├── nginx/
+│   └── nginx.conf
+│
+├── tests/
+│   ├── test_auth.py
+│   ├── test_messages.py
+│   ├── test_encryption.py
+│   ├── test_rabbitmq_events.py
+│   ├── test_idempotency.py
+│   └── test_delivery.py
+│
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+├── .env.example
+├── .gitignore
+└── README.md
+```
+
+This is a suggested architecture.
+
+Adapt it to the existing Stage 2 code rather than unnecessarily restructuring the entire project.
+
+---
+
+# 32. Docker Compose
+
+The Stage 3 Docker environment should approximately contain:
+
+```text
+nginx
+chat_server_1
+chat_server_2
+chat_server_3
+postgres
+redis
+rabbitmq
+```
+
+Potential architecture:
+
+```text
+                 Nginx
+                   │
+       ┌───────────┼───────────┐
+       ▼           ▼           ▼
+    Server1     Server2     Server3
+       │           │           │
+       └───────────┼───────────┘
+                   │
+        ┌──────────┼──────────┐
+        ▼          ▼          ▼
+     Postgres    Redis     RabbitMQ
+```
+
+Use Docker health checks where useful.
+
+Services should not assume that a dependency is instantly ready merely because its container has started.
+
+---
+
+# 33. Environment Variables
+
+Extend configuration with variables such as:
+
+```text
+DATABASE_URL=
+REDIS_URL=
+
+RABBITMQ_URL=
+RABBITMQ_USER=
+RABBITMQ_PASSWORD=
+
+JWT_SECRET=
+JWT_ALGORITHM=
+ACCESS_TOKEN_EXPIRE_MINUTES=
+
+MESSAGE_ENCRYPTION_KEY=
+
+SERVER_ID=
+```
+
+The exact configuration can be adjusted to the existing project.
+
+Do not put real secrets in `.env.example`.
+
+---
+
+# 34. Database Transaction + RabbitMQ Problem
+
+I want to understand an important distributed-systems issue.
+
+Consider:
+
+```text
+1. Save message to PostgreSQL
+2. Commit
+3. Publish RabbitMQ event
+```
+
+What if:
+
+```text
+Step 2 succeeds
+but
+Step 3 fails?
+```
+
+Then the message exists in PostgreSQL but no RabbitMQ event was created.
+
+Alternatively:
+
+```text
+1. Publish RabbitMQ event
+2. Save PostgreSQL message
+```
+
+What if the database write fails?
+
+Then RabbitMQ contains an event for a message that was never persisted.
+
+Explain this **dual-write problem**.
+
+For Stage 3, use either:
+
+### Option A — Simpler Educational Implementation
+
+Persist first and handle RabbitMQ publication failure explicitly, with retry/recovery limitations clearly documented.
+
+OR preferably:
+
+### Option B — Transactional Outbox Pattern
+
+Introduce an outbox table.
+
+Example:
+
+```text
+outbox_events
+
+id
+event_id
+event_type
+payload
+created_at
+published_at
+attempt_count
+```
+
+Within one PostgreSQL transaction:
+
+```text
+BEGIN
+
+INSERT message
+INSERT outbox event
+
+COMMIT
+```
+
+Then a background publisher reads unpublished outbox events and sends them to RabbitMQ.
+
+After successful broker publication:
+
+```text
+published_at = now()
+```
+
+This avoids the most obvious database/broker dual-write gap.
+
+If the complexity is reasonable, I prefer learning the **Transactional Outbox Pattern** because it is an important distributed-systems concept.
+
+---
+
+# 35. Transactional Outbox Flow
+
+Preferred flow:
+
+```text
+Alice sends message
+        │
+        ▼
+FastAPI
+        │
+        ▼
+PostgreSQL Transaction
+        │
+        ├── INSERT encrypted message
+        │
+        └── INSERT outbox event
+        │
+        ▼
+      COMMIT
+        │
+        ▼
+Outbox Publisher
+        │
+        ▼
+RabbitMQ
+        │
+        ▼
+Consumer
+```
+
+If RabbitMQ is temporarily unavailable:
+
+```text
+outbox event remains unpublished
+```
+
+The publisher can try again later.
+
+This is much safer than losing the event immediately.
+
+---
+
+# 36. Outbox Idempotency
+
+The outbox publisher itself may publish the same event more than once in some failure scenarios.
+
+For example:
+
+```text
+Publish succeeds
+       ↓
+Process crashes
+       ↓
+published_at never updated
+       ↓
+event published again
+```
+
+Therefore consumers still need idempotency.
+
+This demonstrates an important distributed-systems principle:
+
+```text
+Outbox reduces lost events.
+
+Idempotent consumers handle duplicates.
+```
+
+---
+
+# 37. Do Not Claim Exactly-Once Delivery
+
+Do not describe the system as having guaranteed exactly-once delivery.
+
+Instead, explain the practical model:
+
+```text
+at-least-once processing
++
+stable event IDs
++
+idempotent consumers
+```
+
+can provide effective once-only business effects in many situations.
+
+I want to understand why distributed systems generally prefer this design rather than relying on a simplistic "exactly once" claim.
+
+---
+
+# 38. Logging and Observability
+
+Stage 3 logs should make the event lifecycle visible.
+
+Example:
+
+```text
+[server-1] message UUID created
+[server-1] encrypted message persisted
+[server-1] outbox event created
+
+[outbox] publishing event UUID
+[outbox] RabbitMQ publish succeeded
+
+[consumer] event UUID received
+[consumer] processing event
+[consumer] Redis delivery event published
+[consumer] event UUID ACKed
+
+[server-3] Redis event received
+[server-3] delivered to Bob
+```
+
+For retries:
+
+```text
+[consumer] event failed attempt 1
+[consumer] scheduled retry
+
+[consumer] event failed attempt 3
+[consumer] routed to DLQ
+```
+
+Never log:
+
+```text
+passwords
+JWT tokens
+encryption keys
+plaintext sensitive messages unnecessarily
+```
+
+---
+
+# 39. Tests
+
+Preserve Stage 1 and Stage 2 tests.
+
+Add Stage 3 tests.
+
+## Encryption tests
+
+Test:
+
+```text
+plaintext → encrypt → ciphertext
+ciphertext → decrypt → original plaintext
+```
+
+Verify that storing identical plaintext twice does not incorrectly depend on deterministic ciphertext.
+
+Verify invalid/tampered ciphertext fails safely.
+
+## RabbitMQ event tests
+
+Test:
+
+- event serialization
+- event validation
+- publishing
+- consumer handling
+- ACK behavior
+- malformed events
+
+## Idempotency tests
+
+Send the same event twice.
+
+Expected business result:
+
+```text
+processed once
+```
+
+## Retry tests
+
+Simulate a transient failure.
+
+Verify:
+
+```text
+failure
+→ retry
+→ successful processing
+```
+
+## DLQ tests
+
+Simulate repeated failure.
+
+Verify:
+
+```text
+maximum attempts reached
+→ dead-letter queue
+```
+
+## Outbox tests
+
+If implementing the transactional outbox:
+
+Verify:
+
+```text
+message + outbox event
+```
+
+are created atomically.
+
+Verify unpublished events can later be published.
+
+Verify already published events are not normally republished.
+
+## Cross-server tests
+
+Verify:
+
+```text
+Alice → Server 1
+Bob → Server 3
+```
+
+still works after RabbitMQ integration.
+
+---
+
+# 40. Important Failure Experiments
+
+I want to intentionally test failures.
+
+### Experiment 1 — Consumer crashes before ACK
+
+Expected:
+
+```text
+event eventually redelivered
+```
+
+Idempotency should prevent duplicate business effects.
+
+### Experiment 2 — RabbitMQ temporarily stopped
+
+If using outbox:
+
+```text
+message stored
+outbox event remains pending
+```
+
+After RabbitMQ returns:
+
+```text
+outbox publisher sends event
+```
+
+### Experiment 3 — Redis unavailable
+
+RabbitMQ event processing should fail according to the chosen retry strategy rather than silently pretending delivery succeeded.
+
+### Experiment 4 — Poison event
+
+A permanently invalid event should not retry forever.
+
+It should eventually reach the DLQ.
+
+### Experiment 5 — Duplicate event
+
+Publish identical event ID twice.
+
+Expected:
+
+```text
+business operation occurs once
+```
+
+### Experiment 6 — Database restart
+
+Persistent messages should remain available after PostgreSQL restarts.
+
+### Experiment 7 — RabbitMQ restart
+
+Durable topology/persistent queued messages should behave according to the configured durability guarantees.
+
+---
+
+# 41. Stage 3 Demo
+
+The final demo should prove reliability rather than simply show that chat works.
+
+Start:
+
+```text
+Nginx
+Server 1
+Server 2
+Server 3
+PostgreSQL
+Redis
+RabbitMQ
+```
+
+Then:
+
+### Normal flow
+
+Alice connects through Server 1.
+
+Bob connects through Server 3.
+
+Alice sends:
+
+```text
+Hello Bob!
+```
+
+Show:
+
+```text
+message encrypted
+      ↓
+PostgreSQL
+      ↓
+outbox
+      ↓
+RabbitMQ
+      ↓
+consumer
+      ↓
+Redis
+      ↓
+Server 3
+      ↓
+Bob
+```
+
+### Reliability demonstration
+
+Temporarily stop the consumer or RabbitMQ at an appropriate point.
+
+Send another message.
+
+Show that the persistent/outbox design retains the required work.
+
+Restore the service.
+
+Show processing continuing.
+
+### Duplicate demonstration
+
+Force/redeliver the same event.
+
+Show that Bob does not receive an incorrect duplicate business result because the consumer is idempotent.
+
+### DLQ demonstration
+
+Send or simulate an event that repeatedly fails.
+
+Show it reaching:
+
+```text
+Dead-Letter Queue
+```
+
+### Encryption demonstration
+
+Inspect PostgreSQL.
+
+The stored message content should be ciphertext rather than readable plaintext.
+
+Then retrieve the conversation normally through the authorized application and show that the application can decrypt it.
+
+---
+
+# 42. Concepts I Should Understand After Stage 3
+
+By the end of Stage 3, I should understand:
+
+### Message Broker
+
+Why RabbitMQ exists between distributed components.
+
+### Queue vs Pub/Sub
+
+Why Redis Pub/Sub and RabbitMQ queues solve different problems.
+
+### Producer/Consumer
+
+How asynchronous distributed processing works.
+
+### Exchanges and Routing
+
+How RabbitMQ routes messages.
+
+### ACK/NACK
+
+How a consumer tells RabbitMQ whether processing succeeded.
+
+### Redelivery
+
+Why messages can be delivered more than once.
+
+### Idempotency
+
+How duplicate processing is prevented.
+
+### Retry
+
+How temporary failures can be retried safely.
+
+### Poison Messages
+
+Why some events should not retry forever.
+
+### Dead-Letter Queue
+
+Where repeatedly failing messages go.
+
+### At-Least-Once Processing
+
+Why duplicates are possible.
+
+### Transactional Outbox
+
+How database changes and broker publication can be coordinated more safely.
+
+### Dual-Write Problem
+
+Why writing independently to PostgreSQL and RabbitMQ is dangerous.
+
+### Application-Level Encryption
+
+Why encrypted database content is different from HTTPS/TLS.
+
+### E2EE vs Server-Side Encryption
+
+Why Stage 3 encryption is NOT end-to-end encryption.
+
+---
+
+# 43. Things NOT to Implement Yet
+
+Do NOT prematurely implement Stage 4.
+
+Avoid:
+
+```text
+full end-to-end encryption
+Signal Protocol
+Double Ratchet
+custom key exchange
+distributed presence system
+heartbeat-based user presence
+automatic WebSocket session recovery
+complex leader election
+distributed consensus
+Kubernetes
+Kafka
+distributed PostgreSQL
+multi-region deployment
+service mesh
+```
+
+Stage 3 should remain focused on:
+
+```text
+RabbitMQ
+   +
+ACKs
+   +
+Retries
+   +
+DLQ
+   +
+Idempotency
+   +
+Transactional Outbox
+   +
+Application-Level Encryption
+```
+
+---
+
+# 44. Stage 3 Completion Criteria
+
+Stage 3 is complete when:
+
+- All Stage 1 features still work.
+- All Stage 2 distributed communication still works.
+- Multiple FastAPI instances remain behind Nginx.
+- PostgreSQL remains shared persistent storage.
+- Redis still supports fast cross-server real-time delivery.
+- RabbitMQ is integrated.
+- RabbitMQ topology is automatically created.
+- Producers can publish validated events.
+- Consumers can process events.
+- Manual acknowledgement is implemented correctly.
+- Failed transient operations can be retried.
+- Retry attempts are bounded.
+- Poison events do not retry forever.
+- Dead-letter handling exists.
+- Messages/events have stable unique IDs.
+- Duplicate events do not cause duplicate business effects.
+- Transactional outbox is implemented, preferably.
+- Outbox events can recover after RabbitMQ downtime.
+- Application-level message encryption is implemented using a standard authenticated-encryption library.
+- Encryption keys are externalized.
+- Plaintext message content is not stored directly in PostgreSQL.
+- Alembic handles schema changes.
+- Docker Compose starts the entire environment.
+- RabbitMQ management UI can be used for development inspection.
+- Stage 1, Stage 2 and Stage 3 tests pass.
+- Failure experiments have been performed.
+- README explains the architecture.
+- I understand why each component exists.
+
+---
+
+# 45. Final Stage 3 Architecture
+
+The system should approximately become:
+
+```text
+                           CLIENTS
+                              │
+                              ▼
+                            NGINX
+                              │
+               ┌──────────────┼──────────────┐
+               ▼              ▼              ▼
+            SERVER 1       SERVER 2       SERVER 3
+            FastAPI        FastAPI        FastAPI
+               │              │              │
+               └──────────────┼──────────────┘
+                              │
+            ┌─────────────────┼─────────────────┐
+            │                 │                 │
+            ▼                 ▼                 ▼
+       POSTGRESQL           REDIS            RABBITMQ
+       Persistent        Real-time          Reliable
+          Data             Events           Queues
+            ▲                                   │
+            │                                   ▼
+            │                               Consumer
+            │                                   │
+            └──────── Outbox ───────────────────┘
+```
+
+A more accurate message flow:
+
+```text
+Alice
+  │
+  ▼
+FastAPI Server 1
+  │
+  ├── Authentication
+  ├── Authorization
+  └── Encrypt message
+          │
+          ▼
+   PostgreSQL Transaction
+      │             │
+      ▼             ▼
+   Message       Outbox Event
+                     │
+                     ▼
+              Outbox Publisher
+                     │
+                     ▼
+                  RabbitMQ
+                     │
+                     ▼
+                  Consumer
+                     │
+              Idempotency Check
+                     │
+                     ▼
+                   Redis
+                     │
+          ┌──────────┼──────────┐
+          ▼          ▼          ▼
+       Server 1   Server 2   Server 3
+                                │
+                                ▼
+                           Bob WebSocket
+```
+
+---
+
+# 46. How I Want Another AI to Implement It
+
+I want to learn while building Stage 3.
+
+Do NOT dump an unexplained repository at once.
+
+Build it step by step.
+
+For every step:
+
+1. Explain the distributed-systems problem.
+2. Explain the solution being introduced.
+3. Tell me which existing Stage 2 files need modification.
+4. Tell me which new files to create.
+5. Give complete code for those files.
+6. Explain important code sections.
+7. Give installation/configuration commands.
+8. Give Docker commands where needed.
+9. Tell me exactly how to test the step.
+10. Tell me what output/logs I should expect.
+11. Wait for me to confirm that the step works before proceeding.
+
+Use approximately this progression:
+
+```text
+Step 1
+Understand RabbitMQ and add it to Docker Compose
+
+Step 2
+Create RabbitMQ connection and topology
+
+Step 3
+Define versioned event models
+
+Step 4
+Add stable message/event UUIDs
+
+Step 5
+Implement application-level message encryption
+
+Step 6
+Update PostgreSQL schema using Alembic
+
+Step 7
+Implement transactional outbox
+
+Step 8
+Implement outbox publisher
+
+Step 9
+Implement RabbitMQ consumer
+
+Step 10
+Connect consumer → Redis → WebSocket delivery
+
+Step 11
+Add manual ACK/NACK behavior
+
+Step 12
+Implement idempotent consumer
+
+Step 13
+Implement bounded retries
+
+Step 14
+Add dead-letter queue
+
+Step 15
+Test cross-server messaging
+
+Step 16
+Perform failure experiments
+
+Step 17
+Add automated tests
+
+Step 18
+Finalize Docker Compose, README and architecture documentation
+```
+
+Do not proceed to Stage 4 until Stage 3 is fully working.
+
+When implementation is complete, provide the final Stage 3 project structure and walk through one message from Alice to Bob through every component.

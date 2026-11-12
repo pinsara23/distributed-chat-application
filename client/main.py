@@ -7,7 +7,7 @@ from crypto import crypto_service
 import os
 
 # --- CONFIGURATION ---
-TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZXhwIjoxNzk0NDY5OTE3fQ.wIAaH9XHMDxu_wEyeI9773poqxWk8Hwc0t8QPYuJhEQ" 
+TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZXhwIjoxNzk0NDcyMTgzfQ.Rm3Y-oNbE7D0zVnU2z6HwhvhPzrkEOEw7ZxANHmEA4E" 
 USER_ID = 1
 TARGET_USER_ID = 2
 CONVERSATION_ID = 1
@@ -130,7 +130,13 @@ async def receive_messages(websocket):
             
             # 1. E2EE Message
             if "cipertext" in data and "nonce" in data:
-                shared_key = await get_shared_key(sender_id)
+                
+                # FIX: If it is our own echoed message, use the Target User's key to decrypt it.
+                # If it is a message from someone else, use their key.
+                decrypt_target_id = TARGET_USER_ID if sender_id == USER_ID else sender_id
+                
+                shared_key = await get_shared_key(decrypt_target_id)
+                
                 if shared_key:
                     try:
                         plaintext = crypto_service.decrypt_message(
@@ -148,6 +154,7 @@ async def receive_messages(websocket):
 
     except ConnectionClosed as e:
         print(f"\n[Client] Connection closed by server: {e.code} {e.reason}")
+
 
 async def send_messages(websocket):
     """Reads terminal input, encrypts it, and sends it to the server."""

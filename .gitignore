@@ -1,21 +1,29 @@
-# Environments
-.env
-.conda/
-env/
+# Virtual Environments
 venv/
+env/
+.venv/
 
-# Python
+# Environment Variables
+.env
+
+# Python Caches
 __pycache__/
 *.py[cod]
 *$py.class
 
-# IDEs
+# Pytest & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE & OS Files
 .vscode/
 .idea/
+*.swp
+.DS_Store
 
-stage3_prompt.txt
-stage4_propmt.txt
-
-local_identity.key
-bob.key
+# Local Cryptography & Client State (CRITICAL)
+*.key
 known_hosts.json
+bob_known_hosts.json
+client_bob/
