@@ -111,9 +111,12 @@ services:
     image: pinsara23/distributed-chat:latest
     labels:
       - com.centurylinklabs.watchtower.enable=true
+    env_file:
+      - .env
     environment:
       SERVER_ID: chat-server-1
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_db}
+      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_db}
       REDIS_URL: redis://redis:6379/0
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
     depends_on:
@@ -132,9 +135,12 @@ services:
     image: pinsara23/distributed-chat:latest
     labels:
       - com.centurylinklabs.watchtower.enable=true
+    env_file:
+      - .env
     environment:
       SERVER_ID: chat-server-2
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_db}
+      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_db}
       REDIS_URL: redis://redis:6379/0
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
     depends_on:
@@ -153,9 +159,12 @@ services:
     image: pinsara23/distributed-chat:latest
     labels:
       - com.centurylinklabs.watchtower.enable=true
+    env_file:
+      - .env
     environment:
       SERVER_ID: chat-server-3
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_db}
+      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_db}
       REDIS_URL: redis://redis:6379/0
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
     depends_on:
