@@ -35,25 +35,63 @@ def save_known_hosts(hosts_data: dict):
 
 # Cache to store derived AES keys so we don't have to recalculate them every message
 shared_keys_cache = {}
+MESSAGE_CURSOR_FILE = "alice_message_cursor.json"
+
+def load_message_cursor():
+    if not os.path.exists(MESSAGE_CURSOR_FILE):
+        return 0
+
+    try:
+        with open(MESSAGE_CURSOR_FILE, "r") as f:
+            state = json.load(f)
+
+        if state.get("conversation_id") != CONVERSATION_ID:
+            return 0
+
+        return int(state.get("last_message_id", 0))
+
+    except (ValueError, json.JSONDecodeError, OSError):
+        return 0
+
+
+LAST_MESSAGE_ID = load_message_cursor()
+SEEN_MESSAGE_IDS = set()
+
+
+def update_message_cursor(message_id):
+    global LAST_MESSAGE_ID
+
+    if message_id is None or message_id <= LAST_MESSAGE_ID:
+        return
+
+    LAST_MESSAGE_ID = message_id
+
+    with open(MESSAGE_CURSOR_FILE, "w") as f:
+        json.dump({
+            "conversation_id": CONVERSATION_ID,
+            "last_message_id": LAST_MESSAGE_ID
+        }, f, indent=4)
 
 async def register_public_key():
-    """Generates local keys and uploads the public key to the server."""
+    """Loads local identity and registers its public key with the server."""
     crypto_service.load_or_generate_keys()
-    
-    fingerprint = crypto_service.get_fingerprint(crypto_service.public_key_pem)
-    print(f"\n==================================================")
-    print(f"🔐 MY SECURITY FINGERPRINT: {fingerprint}")
-    print(f"==================================================\n")
 
     headers = {"Authorization": f"Bearer {TOKEN}"}
     payload = {"public_key_pem": crypto_service.public_key_pem}
-    
+
     async with aiohttp.ClientSession() as session:
-        async with session.post(f"{REST_URL}/keys/", headers=headers, json=payload) as resp:
-            if resp.status == 200:
-                print(f"[Client] Public Key successfully registered with server.")
-            else:
-                print(f"[Client] ⚠️ Failed to register Public Key: {await resp.text()}")
+        async with session.post(
+            f"{REST_URL}/keys/",
+            json=payload,
+            headers=headers
+        ) as resp:
+            if resp.status not in (200, 201):
+                raise RuntimeError(
+                    f"Public key registration failed: {resp.status} "
+                    f"{await resp.text()}"
+                )
+
+            print("[Crypto] Public key registered successfully.")
 
 async def get_shared_key(peer_id: int) -> bytes:
     """Fetches peer's public key from the server, verifies identity, and derives AES key."""
@@ -116,8 +154,64 @@ async def get_shared_key(peer_id: int) -> bytes:
                 print(f"[Crypto] ⚠️ Could not fetch public key for User {peer_id}")
                 return None
 
+
+async def handle_message(data):
+    """Decrypts and displays a message, ignoring already processed messages."""
+
+    global LAST_MESSAGE_ID
+
+    message_id = data.get("id")
+    sender_id = data.get("sender_id")
+
+    if message_id is not None:
+        message_id = int(message_id)
+
+        if message_id <= LAST_MESSAGE_ID:
+            return True
+
+        if message_id in SEEN_MESSAGE_IDS:
+            return True
+
+    if "cipertext" in data and "nonce" in data:
+
+        decrypt_target_id = (
+            TARGET_USER_ID if sender_id == USER_ID else sender_id
+        )
+
+        shared_key = await get_shared_key(decrypt_target_id)
+
+        if not shared_key:
+            print(f"[Crypto] Cannot decrypt message {message_id}: key unavailable.")
+            return False
+
+        try:
+            plaintext = crypto_service.decrypt_message(
+                data["cipertext"],
+                data["nonce"],
+                shared_key
+            )
+
+            print(f"\n[User {sender_id} 🔒]: {plaintext}")
+
+        except Exception as e:
+            print(f"\n[Crypto] Failed to decrypt message {message_id}: {e}")
+            return False
+
+    elif "content" in data:
+        print(f"\n[User {sender_id}]: {data['content']}")
+
+    else:
+        return False
+
+    if message_id is not None:
+        SEEN_MESSAGE_IDS.add(message_id)
+        update_message_cursor(message_id)
+
+    return True
+
 async def receive_messages(websocket):
-    """Listens for incoming WebSocket messages and decrypts them."""
+    """Receives live messages and decrypts them."""
+
     try:
         while True:
             response = await websocket.recv()
@@ -127,39 +221,13 @@ async def receive_messages(websocket):
                 continue
 
             if "error" in data:
-                print(f"⚠️ Server Error: {data['error']}")
+                print(f"[Server Error]: {data['error']}")
                 continue
 
-            # --- DECRYPTION LOGIC ---
-            sender_id = data.get("sender_id")
-            
-            # 1. E2EE Message
-            if "cipertext" in data and "nonce" in data:
-                
-                # FIX: If it is our own echoed message, use the Target User's key to decrypt it.
-                # If it is a message from someone else, use their key.
-                decrypt_target_id = TARGET_USER_ID if sender_id == USER_ID else sender_id
-                
-                shared_key = await get_shared_key(decrypt_target_id)
-                
-                if shared_key:
-                    try:
-                        plaintext = crypto_service.decrypt_message(
-                            data["cipertext"], 
-                            data["nonce"], 
-                            shared_key
-                        )
-                        print(f"\n[User {sender_id} 🔒]: {plaintext}")
-                    except Exception as e:
-                        print(f"\n[User {sender_id} 🚨]: FAILED TO DECRYPT (Tampered or Wrong Key!)")
-            
-            # 2. Legacy Stage 3 Message Fallback
-            elif "content" in data:
-                print(f"\n[User {sender_id} 🔓]: {data['content']}")
+            await handle_message(data)
 
     except ConnectionClosed as e:
-        print(f"\n[Client] Connection closed by server: {e.code} {e.reason}")
-
+        print(f"\n[Client] Connection closed: {e.code} {e.reason}")
 
 async def send_messages(websocket):
     """Reads terminal input, encrypts it, and sends it to the server."""
@@ -201,13 +269,18 @@ async def heartbeat(websocket):
 
 async def connect_with_retry():
     retry_delay = 1.0
+
     while True:
         try:
             print("[Client] Attempting to connect to the server...")
+
             async with websockets.connect(WS_URL) as websocket:
                 print("[Client] Successfully connected! 🟢")
-                retry_delay = 1.0 
-                
+                retry_delay = 1.0
+
+                # Retrieve messages missed while offline
+                await sync_missed_messages()
+
                 receive_task = asyncio.create_task(receive_messages(websocket))
                 send_task = asyncio.create_task(send_messages(websocket))
                 heartbeat_task = asyncio.create_task(heartbeat(websocket))
@@ -216,13 +289,88 @@ async def connect_with_retry():
                     [receive_task, send_task, heartbeat_task],
                     return_when=asyncio.FIRST_COMPLETED
                 )
+
                 for task in pending:
                     task.cancel()
-                    
+
+                await asyncio.gather(*pending, return_exceptions=True)
+
         except Exception as e:
-            print(f"[Client] 🔴 Disconnected. Reconnecting in {retry_delay:.2f} seconds...")
+            print(
+                f"[Client] 🔴 Disconnected. "
+                f"Reconnecting in {retry_delay:.2f} seconds..."
+            )
+
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 1.5, 30.0)
+            
+async def sync_missed_messages():
+    """Retrieves messages missed while this client was offline."""
+
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+
+    print("\n[Sync] Checking for missed messages...")
+
+    async with aiohttp.ClientSession() as session:
+
+        if LAST_MESSAGE_ID > 0:
+            params = {"after_id": LAST_MESSAGE_ID}
+
+            async with session.get(
+                f"{REST_URL}/conversations/{CONVERSATION_ID}/messages",
+                headers=headers,
+                params=params
+            ) as resp:
+
+                if resp.status != 200:
+                    raise RuntimeError(
+                        f"History retrieval failed: {resp.status} "
+                        f"{await resp.text()}"
+                    )
+
+                messages = await resp.json()
+
+                for message in messages:
+                    if not await handle_message(message):
+                        print("[Sync] Stopped because a message could not be decrypted.")
+                        return
+
+        else:
+            # First synchronization: retrieve all pages.
+            page = 1
+            limit = 50
+
+            while True:
+                params = {"page": page, "limit": limit}
+
+                async with session.get(
+                    f"{REST_URL}/conversations/{CONVERSATION_ID}/messages",
+                    headers=headers,
+                    params=params
+                ) as resp:
+
+                    if resp.status != 200:
+                        raise RuntimeError(
+                            f"History retrieval failed: {resp.status} "
+                            f"{await resp.text()}"
+                        )
+
+                    messages = await resp.json()
+
+                if not messages:
+                    break
+
+                for message in messages:
+                    if not await handle_message(message):
+                        print("[Sync] Stopped because a message could not be decrypted.")
+                        return
+
+                if len(messages) < limit:
+                    break
+
+                page += 1
+
+    print(f"[Sync] Synchronization complete. Last message ID: {LAST_MESSAGE_ID}")
 
 async def start_client():
     await register_public_key()
