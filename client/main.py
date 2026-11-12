@@ -4,15 +4,29 @@ import aiohttp
 import websockets
 from websockets.exceptions import ConnectionClosed
 from crypto import crypto_service
+import os
 
 # --- CONFIGURATION ---
-TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZXhwIjoxNzk0MzQ3NzM4fQ.SGA2uHkCpjBHPhmvVMUpFJ65tZ4NFhKDXLXur0fRaCU" 
+TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZXhwIjoxNzk0NDY5OTE3fQ.wIAaH9XHMDxu_wEyeI9773poqxWk8Hwc0t8QPYuJhEQ" 
 USER_ID = 1
 TARGET_USER_ID = 2
 CONVERSATION_ID = 1
 
 REST_URL = "http://127.0.0.1:8001"
 WS_URL = f"ws://127.0.0.1:8001/ws/chat?token={TOKEN}"
+
+# --- STEP 22: TOFU STORAGE ---
+KNOWN_HOSTS_FILE = "known_hosts.json"
+
+def load_known_hosts() -> dict:
+    if os.path.exists(KNOWN_HOSTS_FILE):
+        with open(KNOWN_HOSTS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_known_hosts(hosts_data: dict):
+    with open(KNOWN_HOSTS_FILE, "w") as f:
+        json.dump(hosts_data, f, indent=4)
 
 # Cache to store derived AES keys so we don't have to recalculate them every message
 shared_keys_cache = {}
@@ -37,7 +51,7 @@ async def register_public_key():
                 print(f"[Client] ⚠️ Failed to register Public Key: {await resp.text()}")
 
 async def get_shared_key(peer_id: int) -> bytes:
-    """Fetches peer's public key from the server and derives the AES shared secret."""
+    """Fetches peer's public key from the server, verifies identity, and derives AES key."""
     if peer_id in shared_keys_cache:
         return shared_keys_cache[peer_id]
 
@@ -49,6 +63,43 @@ async def get_shared_key(peer_id: int) -> bytes:
             if resp.status == 200:
                 data = await resp.json()
                 peer_pem = data["public_key_pem"]
+                peer_version = data["key_version"]
+                
+                new_fingerprint = crypto_service.get_fingerprint(peer_pem)
+                
+                # --- STEP 22: IDENTITY VERIFICATION (TOFU) ---
+                known_hosts = load_known_hosts()
+                str_peer_id = str(peer_id)
+                
+                if str_peer_id in known_hosts:
+                    saved_fingerprint = known_hosts[str_peer_id]["fingerprint"]
+                    saved_version = known_hosts[str_peer_id]["version"]
+                    
+                    if new_fingerprint != saved_fingerprint:
+                        print("\n🚨🚨🚨 SECURITY ALERT 🚨🚨🚨")
+                        print(f"User {peer_id}'s public key has CHANGED (Version {saved_version} -> {peer_version}).")
+                        print(f"Old Fingerprint: {saved_fingerprint}")
+                        print(f"New Fingerprint: {new_fingerprint}")
+                        print("This could be a new device, or a Man-In-The-Middle attack!")
+                        
+                        loop = asyncio.get_running_loop()
+                        accept = await loop.run_in_executor(None, input, "Do you want to trust this new key? (yes/no): ")
+                        
+                        if accept.strip().lower() != "yes":
+                            print("[Crypto] Connection aborted to protect your security.")
+                            return None
+                        
+                        # User accepted the risk, update known hosts
+                        known_hosts[str_peer_id] = {"fingerprint": new_fingerprint, "version": peer_version}
+                        save_known_hosts(known_hosts)
+                        print("[Crypto] New key trusted and saved.")
+                else:
+                    # First time seeing this user (Trust On First Use)
+                    print(f"[Crypto] 🆕 First time connecting with User {peer_id}.")
+                    print(f"Saving their fingerprint: {new_fingerprint}")
+                    known_hosts[str_peer_id] = {"fingerprint": new_fingerprint, "version": peer_version}
+                    save_known_hosts(known_hosts)
+                # ---------------------------------------------
                 
                 # Derive the AES key using ECDH!
                 shared_key = crypto_service.derive_shared_key(peer_pem)

@@ -18,3 +18,4 @@ stage4_propmt.txt
 
 local_identity.key
 bob.key
+known_hosts.json
