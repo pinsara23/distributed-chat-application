@@ -196,6 +196,7 @@ The backend reads configuration from `.env` using Pydantic Settings. For local, 
 
 ```powershell
 conda activate chat-stage2
+pip install -r requirements.txt
 alembic upgrade head
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
