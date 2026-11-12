@@ -1,0 +1,49 @@
+
+# In a distributed architecture, clients (like a React frontend or Postman) should never have to manually choose whether to 
+# connect to Server 1, Server 2, or Server 3. We place a Load Balancer in front of them to act as a single, 
+# unified entry point. Nginx will receive all traffic on port 8000 and distribute it evenly across our 
+# three FastAPI instances using a "round-robin" strategy.
+
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    # Define our pool of backend FastAPI servers
+    upstream chat_servers {
+        server 127.0.0.1:8001;
+        server 127.0.0.1:8002;
+        server 127.0.0.1:8003;
+    }
+
+    server {
+        listen 8000;
+        
+        # Route standard HTTP REST requests
+        location / {
+            proxy_pass http://chat_servers;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+        }
+
+        # Route WebSocket connections
+        location /ws/ {
+            proxy_pass http://chat_servers;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "Upgrade";
+            proxy_set_header Host $host;
+        }
+    }
+}
+
+
+# upstream chat_servers: 
+# This registers our three running instances into a single pool. 
+# By default, Nginx sends Request 1 to Server 1, Request 2 to Server 2, Request 3 to Server 3, and then loops back.
+
+# Upgrade and Connection headers: 
+# Standard HTTP requests are short-lived. 
+# WebSockets require an ongoing TCP connection. These specific headers tell Nginx to "upgrade" the 
+# HTTP request into a persistent WebSocket tunnel and proxy that continuous stream to the backend server.

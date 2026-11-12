@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.git/
+client/
+client_bob/
+tests/
+*.key
+*known_hosts.json
+venv/
+env/
+.venv/

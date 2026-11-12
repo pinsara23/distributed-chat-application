@@ -1,0 +1,201 @@
+
+services:
+  # ----------------------------------------
+  # Primary PostgreSQL Database
+  # ----------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-chat_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ----------------------------------------
+  # Automated PostgreSQL Backup
+  # ----------------------------------------
+  postgres_backup:
+    image: postgres:15-alpine
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-admin}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB:-chat_db}
+      BACKUP_INTERVAL_SECONDS: 86400
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        while true; do
+          timestamp=$$(date +%Y%m%d_%H%M%S)
+          backup="/backups/chat_db_$${timestamp}.dump"
+          temp="$${backup}.tmp"
+
+          echo "Starting PostgreSQL backup..."
+
+          if pg_dump -F c -f "$$temp"; then
+            mv "$$temp" "$$backup"
+            echo "Backup completed: $$backup"
+
+            find /backups -type f \
+              -name 'chat_db_*.dump' -mtime +7 -delete
+          else
+            rm -f "$$temp"
+            echo "Backup failed!"
+          fi
+
+          sleep "$$BACKUP_INTERVAL_SECONDS"
+        done
+    restart: unless-stopped
+
+  # ----------------------------------------
+  # Redis
+  # ----------------------------------------
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ----------------------------------------
+  # RabbitMQ
+  # ----------------------------------------
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-admin}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test:
+        - CMD
+        - rabbitmq-diagnostics
+        - check_port_connectivity
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ----------------------------------------
+  # Chat Server 1
+  # ----------------------------------------
+  chat_server_1:
+    image: pinsara23/distributed-chat:latest
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+    environment:
+      SERVER_ID: chat-server-1
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_db}
+      REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ----------------------------------------
+  # Chat Server 2
+  # ----------------------------------------
+  chat_server_2:
+    image: pinsara23/distributed-chat:latest
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+    environment:
+      SERVER_ID: chat-server-2
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_db}
+      REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ----------------------------------------
+  # Chat Server 3
+  # ----------------------------------------
+  chat_server_3:
+    image: pinsara23/distributed-chat:latest
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+    environment:
+      SERVER_ID: chat-server-3
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_db}
+      REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ----------------------------------------
+  # Nginx Load Balancer
+  # ----------------------------------------
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - chat_server_1
+      - chat_server_2
+      - chat_server_3
+    restart: unless-stopped
+
+  # ----------------------------------------
+  # Watchtower - Automatic Image Updates
+  # ----------------------------------------
+  watchtower:
+    image: containrrr/watchtower:latest
+    command: --label-enable --interval 300 --cleanup
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+# ----------------------------------------
+# Persistent Volumes
+# ----------------------------------------
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:

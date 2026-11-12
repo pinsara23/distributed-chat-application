@@ -27,3 +27,5 @@ htmlcov/
 known_hosts.json
 bob_known_hosts.json
 client_bob/
+dockerhub.txt
+backups/

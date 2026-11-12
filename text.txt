@@ -112,3 +112,5 @@ Graceful Degradation: If a non-critical component (like Redis presence) fails, t
 
 Eventual Consistency: If RabbitMQ fails, the message might be delayed, 
 but the Transactional Outbox pattern guarantees it will eventually be delivered once RabbitMQ returns.
+
+python -c "import secrets; print(secrets.token_urlsafe(32))"
