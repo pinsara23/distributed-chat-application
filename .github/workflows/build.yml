@@ -1,16 +1,88 @@
-name: Build and Push to Docker Hub
+name: Test, Build and Push to Docker Hub
 
 on:
   push:
     branches:
       - new-version
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per branch at a time; a newer push waits instead of cancelling a
+# build that may be halfway through pushing the image.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build-and-push:
+  test:
+    name: Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # The suite needs only PostgreSQL (Redis/RabbitMQ are faked in the tests).
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: chat_test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d chat_test_db"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    # Settings (app/core/config.py) and tests/conftest.py read these.
+    env:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: chat_test_db
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/chat_test_db
+      JWT_SECRET_KEY: ci-only-secret-not-used-anywhere-else
+
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Fails the build if the migration and the SQLAlchemy models drift apart,
+      # or if the migration cannot be applied or reverted on an empty database.
+      - name: Verify Alembic migration
+        run: |
+          alembic upgrade head
+          alembic check
+          alembic downgrade base
+
+      - name: Run tests
+        run: pytest -q
+
+  build-and-push:
+    name: Build and push image
+    needs: test            # only runs when every test passed
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/distributed-chat
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -18,9 +90,45 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push Docker image
+      # Build once into the local Docker daemon so the image can be inspected
+      # before anything is pushed. Layers go to the GitHub Actions cache.
+      - name: Build image (not pushed yet)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: ci-check:latest
+          cache-from: type=gha,scope=chat-image
+          cache-to: type=gha,mode=max,scope=chat-image
+
+      - name: Check the image
+        run: |
+          # Alembic config and migrations are inside the image (the compose
+          # `migrate` service depends on them) and there is a single head.
+          docker run --rm ci-check:latest alembic heads | tee heads.txt
+          test "$(grep -c '(head)' heads.txt)" = "1"
+
+          # The application imports with every dependency installed.
+          docker run --rm \
+            -e POSTGRES_USER=x -e POSTGRES_PASSWORD=x -e POSTGRES_DB=x \
+            -e DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
+            -e JWT_SECRET_KEY=x \
+            ci-check:latest python -c "import app.main"
+
+          # Secrets and local state never ship in the image.
+          docker run --rm --entrypoint sh ci-check:latest -c '
+            test ! -e /app/.env &&
+            test -z "$(find /app \( -name "*.key" -o -name "*known_hosts.json" -o -name ".env*" \) -print)"
+          '
+
+      # Same build again: every layer comes from the cache, so this is fast.
+      - name: Push to Docker Hub (latest + commit SHA)
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/distributed-chat:latest
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha,scope=chat-image
+          cache-to: type=gha,mode=max,scope=chat-image

@@ -8,7 +8,7 @@ async def test_conversation_lifecycle(async_client: AsyncClient):
         "/auth/register", 
         json={"username": "alice_chat", "email": "alice_chat@example.com", "password": "pass"}
     )
-    alice_id = res_a.json()["id"]
+    assert res_a.status_code == 201
 
     # 2. Register User B (Bob)
     res_b = await async_client.post(

@@ -3,25 +3,54 @@ import json
 import aiohttp
 import websockets
 from websockets.exceptions import ConnectionClosed
-from crypto import crypto_service
+from crypto import STATE_PREFIX, crypto_service, build_aad
 import os
+import getpass
+import uuid
 
 # --- CONFIGURATION ---
-TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZXhwIjoxNzk0NTE0MTQ3fQ.tndCSIclEj-peerWMKdkh8CQCYM9xMWwit4cxV66XyM" 
-USER_ID = 1
-TARGET_USER_ID = 2
-CONVERSATION_ID = 1
+# Credentials are never stored in source. Set CHAT_USERNAME / CHAT_PASSWORD in
+# the environment (or type them when prompted). A fresh JWT is requested on
+# every (re)connect, so an expired token can never wedge the client.
+USER_ID = int(os.environ.get("CHAT_USER_ID", "1"))
+TARGET_USER_ID = int(os.environ.get("CHAT_TARGET_USER_ID", "2"))
+CONVERSATION_ID = int(os.environ.get("CHAT_CONVERSATION_ID", "1"))
 
-# SERVER_IP = "localhost"
-# REST_URL = f"http://{SERVER_IP}:8000"
-# WS_URL = f"ws://{SERVER_IP}:8000/ws/chat?token={TOKEN}"
+SERVER_HOST = os.environ.get("CHAT_SERVER_HOST", "localhost:8000")
+REST_URL = f"http://{SERVER_HOST}"
+WS_BASE_URL = f"ws://{SERVER_HOST}/ws/chat"
 
-SERVER_IP = "192.168.43.47"
-REST_URL = f"http://{SERVER_IP}"
-WS_URL = f"ws://{SERVER_IP}/ws/chat?token={TOKEN}"
+TOKEN = None
+_CREDENTIALS = None
+
+
+def _get_credentials() -> tuple[str, str]:
+    global _CREDENTIALS
+    if _CREDENTIALS is None:
+        username = os.environ.get("CHAT_USERNAME") or input("Username: ")
+        password = os.environ.get("CHAT_PASSWORD") or getpass.getpass("Password: ")
+        _CREDENTIALS = (username, password)
+    return _CREDENTIALS
+
+
+async def login() -> str:
+    """Authenticate against /auth/login and store a fresh access token."""
+    global TOKEN
+    username, password = _get_credentials()
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{REST_URL}/auth/login",
+            data={"username": username, "password": password},
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"Login failed: {resp.status} {await resp.text()}")
+            TOKEN = (await resp.json())["access_token"]
+    print("[Auth] Obtained a fresh access token.")
+    return TOKEN
+
 
 # --- STEP 22: TOFU STORAGE ---
-KNOWN_HOSTS_FILE = "known_hosts.json"
+KNOWN_HOSTS_FILE = f"{STATE_PREFIX}_known_hosts.json"
 
 def load_known_hosts() -> dict:
     if os.path.exists(KNOWN_HOSTS_FILE):
@@ -35,42 +64,54 @@ def save_known_hosts(hosts_data: dict):
 
 # Cache to store derived AES keys so we don't have to recalculate them every message
 shared_keys_cache = {}
-MESSAGE_CURSOR_FILE = "alice_message_cursor.json"
+MESSAGE_CURSOR_FILE = f"{STATE_PREFIX}_message_cursor.json"
 
-def load_message_cursor():
+SEEN_HISTORY_LIMIT = 2000   # how many recent message ids are remembered on disk
+SYNC_OVERLAP = 500          # re-request this many ids below the cursor on sync
+
+
+def _load_state() -> dict:
     if not os.path.exists(MESSAGE_CURSOR_FILE):
-        return 0
-
+        return {}
     try:
         with open(MESSAGE_CURSOR_FILE, "r") as f:
             state = json.load(f)
-
         if state.get("conversation_id") != CONVERSATION_ID:
-            return 0
-
-        return int(state.get("last_message_id", 0))
-
+            return {}
+        return state
     except (ValueError, json.JSONDecodeError, OSError):
-        return 0
+        return {}
 
 
-LAST_MESSAGE_ID = load_message_cursor()
-SEEN_MESSAGE_IDS = set()
+_STATE = _load_state()
+LAST_MESSAGE_ID = int(_STATE.get("last_message_id", 0))
+# Duplicate suppression is by message id, NOT by "id <= cursor": ids can arrive
+# out of order (broker retries), and a late lower id must still be shown.
+SEEN_MESSAGE_IDS = {int(i) for i in _STATE.get("seen_ids", [])}
 
 
-def update_message_cursor(message_id):
-    global LAST_MESSAGE_ID
-
-    if message_id is None or message_id <= LAST_MESSAGE_ID:
-        return
-
-    LAST_MESSAGE_ID = message_id
-
+def _save_state():
+    recent = sorted(SEEN_MESSAGE_IDS)[-SEEN_HISTORY_LIMIT:]
     with open(MESSAGE_CURSOR_FILE, "w") as f:
         json.dump({
             "conversation_id": CONVERSATION_ID,
-            "last_message_id": LAST_MESSAGE_ID
+            "last_message_id": LAST_MESSAGE_ID,
+            "seen_ids": recent,
         }, f, indent=4)
+
+
+def mark_seen(message_id):
+    """Record a processed message and advance the (max-id) sync cursor."""
+    global LAST_MESSAGE_ID
+
+    if message_id is None:
+        return
+
+    SEEN_MESSAGE_IDS.add(message_id)
+    if message_id > LAST_MESSAGE_ID:
+        LAST_MESSAGE_ID = message_id
+    _save_state()
+
 
 async def register_public_key():
     """Loads local identity and registers its public key with the server."""
@@ -125,8 +166,7 @@ async def get_shared_key(peer_id: int) -> bytes:
                         print(f"New Fingerprint: {new_fingerprint}")
                         print("This could be a new device, or a Man-In-The-Middle attack!")
                         
-                        loop = asyncio.get_running_loop()
-                        accept = await loop.run_in_executor(None, input, "Do you want to trust this new key? (yes/no): ")
+                        accept = await ask_user("Do you want to trust this new key? (yes/no): ")
                         
                         if accept.strip().lower() != "yes":
                             print("[Crypto] Connection aborted to protect your security.")
@@ -158,21 +198,20 @@ async def get_shared_key(peer_id: int) -> bytes:
 async def handle_message(data):
     """Decrypts and displays a message, ignoring already processed messages."""
 
-    global LAST_MESSAGE_ID
-
     message_id = data.get("id")
     sender_id = data.get("sender_id")
+
+    # The server echoing our own message back means it is durably stored.
+    if sender_id == USER_ID:
+        PENDING.pop(data.get("message_uuid"), None)
 
     if message_id is not None:
         message_id = int(message_id)
 
-        if message_id <= LAST_MESSAGE_ID:
-            return True
-
         if message_id in SEEN_MESSAGE_IDS:
             return True
 
-    if "cipertext" in data and "nonce" in data:
+    if "ciphertext" in data and "nonce" in data:
 
         decrypt_target_id = (
             TARGET_USER_ID if sender_id == USER_ID else sender_id
@@ -185,27 +224,32 @@ async def handle_message(data):
             return False
 
         try:
+            aad = build_aad(
+                data["message_uuid"],
+                int(data["conversation_id"]),
+                int(sender_id),
+            )
             plaintext = crypto_service.decrypt_message(
-                data["cipertext"],
+                data["ciphertext"],
                 data["nonce"],
-                shared_key
+                shared_key,
+                aad,
             )
 
             print(f"\n[User {sender_id} 🔒]: {plaintext}")
 
         except Exception as e:
-            print(f"\n[Crypto] Failed to decrypt message {message_id}: {e}")
-            return False
-
-    elif "content" in data:
-        print(f"\n[User {sender_id}]: {data['content']}")
+            # Authentication failed (tampered or wrong key): this is permanent,
+            # so flag it and move on instead of blocking every later message.
+            print(f"\n[Crypto] ⚠️ Message {message_id} from User {sender_id} "
+                  f"failed authentication and was skipped: {e!r}")
+            mark_seen(message_id)
+            return True
 
     else:
-        return False
+        print(f"[Sync] Ignoring message {message_id}: not an E2EE envelope.")
 
-    if message_id is not None:
-        SEEN_MESSAGE_IDS.add(message_id)
-        update_message_cursor(message_id)
+    mark_seen(message_id)
 
     return True
 
@@ -222,6 +266,11 @@ async def receive_messages(websocket):
 
             if "error" in data:
                 print(f"[Server Error]: {data['error']}")
+                # A permanent rejection of one of our messages: stop resending it.
+                failed_id = data.get("message_id")
+                if failed_id and not data.get("retryable", False):
+                    if PENDING.pop(failed_id, None) is not None:
+                        print(f"[Send] Message {failed_id} was rejected and discarded.")
                 continue
 
             await handle_message(data)
@@ -229,33 +278,83 @@ async def receive_messages(websocket):
     except ConnectionClosed as e:
         print(f"\n[Client] Connection closed: {e.code} {e.reason}")
 
-async def send_messages(websocket):
-    """Reads terminal input, encrypts it, and sends it to the server."""
-    loop = asyncio.get_running_loop()
-    
-    # Pre-fetch Bob's key so we are ready to encrypt
-    shared_key = await get_shared_key(TARGET_USER_ID)
-    
-    while True:
-        message_text = await loop.run_in_executor(None, input, "")
-        if not message_text:
-            continue
 
-        if not shared_key:
+# --- OUTBOUND QUEUE -----------------------------------------------------------
+# Lines typed by the user wait in TEXT_QUEUE (one stdin reader for the whole
+# process, independent of the connection). Once encrypted, a message sits in
+# PENDING until the server echoes it back, and is re-sent after a reconnect.
+# Re-sending is safe: the server treats message_id as an idempotency key.
+TEXT_QUEUE: "asyncio.Queue[str] | None" = None
+PENDING: dict[str, dict] = {}
+
+
+async def ask_user(prompt: str) -> str:
+    """Ask a question on the terminal.
+
+    Once the stdin reader thread is running it owns stdin, so an answer must
+    come through its queue; a second input() call would race it and the answer
+    would be sent as a chat message instead.
+    """
+    print(prompt, end="", flush=True)
+    if TEXT_QUEUE is not None:
+        return await TEXT_QUEUE.get()
+    return await asyncio.get_running_loop().run_in_executor(None, input, "")
+
+
+def start_stdin_reader(loop: asyncio.AbstractEventLoop, queue: "asyncio.Queue[str]"):
+    """Read terminal lines on a daemon thread so Ctrl+C / reconnects never hang."""
+    import threading
+
+    def run():
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                return
+            if line:
+                loop.call_soon_threadsafe(queue.put_nowait, line)
+
+    threading.Thread(target=run, daemon=True, name="stdin-reader").start()
+
+
+async def prepare_payload(message_text: str) -> dict | None:
+    """Encrypt locally BEFORE anything is sent to FastAPI."""
+    shared_key = await get_shared_key(TARGET_USER_ID)
+    if not shared_key:
+        return None
+
+    message_id = str(uuid.uuid4())
+    aad = build_aad(message_id, CONVERSATION_ID, USER_ID)
+    ciphertext, nonce = crypto_service.encrypt_message(message_text, shared_key, aad)
+    return {
+        "message_id": message_id,
+        "conversation_id": CONVERSATION_ID,
+        "target_user_id": TARGET_USER_ID,
+        "ciphertext": ciphertext,
+        "nonce": nonce,
+        "key_version": 1,
+    }
+
+
+async def send_messages(websocket):
+    """Re-send unacknowledged messages, then send newly typed ones."""
+    for payload in list(PENDING.values()):
+        await websocket.send(json.dumps(payload))
+        print(f"[Send] Re-sent unacknowledged message {payload['message_id']}.")
+
+    while True:
+        message_text = await TEXT_QUEUE.get()
+        try:
+            payload = await prepare_payload(message_text)
+        except asyncio.CancelledError:
+            TEXT_QUEUE.put_nowait(message_text)  # do not lose the line on reconnect
+            raise
+
+        if payload is None:
             print("⚠️ Cannot send message: E2EE not established with target user.")
             continue
 
-        # --- ENCRYPTION LOGIC ---
-        # Encrypt locally BEFORE sending to FastAPI
-        cipertext, nonce = crypto_service.encrypt_message(message_text, shared_key)
-
-        payload = {
-            "conversation_id": CONVERSATION_ID,
-            "target_user_id": TARGET_USER_ID,
-            "cipertext": cipertext,
-            "nonce": nonce,
-            "key_version": 1
-        }
+        PENDING[payload["message_id"]] = payload  # kept until the server echoes it
         await websocket.send(json.dumps(payload))
 
 async def heartbeat(websocket):
@@ -274,7 +373,10 @@ async def connect_with_retry():
         try:
             print("[Client] Attempting to connect to the server...")
 
-            async with websockets.connect(WS_URL) as websocket:
+            await login()  # re-authenticate on every (re)connect
+            ws_url = f"{WS_BASE_URL}?token={TOKEN}"
+
+            async with websockets.connect(ws_url) as websocket:
                 print("[Client] Successfully connected! 🟢")
                 retry_delay = 1.0
 
@@ -297,7 +399,7 @@ async def connect_with_retry():
 
         except Exception as e:
             print(
-                f"[Client] 🔴 Disconnected. "
+                f"[Client] 🔴 Disconnected ({e}). "
                 f"Reconnecting in {retry_delay:.2f} seconds..."
             )
 
@@ -314,7 +416,9 @@ async def sync_missed_messages():
     async with aiohttp.ClientSession() as session:
 
         if LAST_MESSAGE_ID > 0:
-            params = {"after_id": LAST_MESSAGE_ID}
+            # Overlap the cursor so late (out-of-order) lower ids are re-fetched;
+            # already-seen ids are filtered out by handle_message.
+            params = {"after_id": max(1, LAST_MESSAGE_ID - SYNC_OVERLAP)}
 
             async with session.get(
                 f"{REST_URL}/conversations/{CONVERSATION_ID}/messages",
@@ -373,11 +477,19 @@ async def sync_missed_messages():
     print(f"[Sync] Synchronization complete. Last message ID: {LAST_MESSAGE_ID}")
 
 async def start_client():
+    global TEXT_QUEUE
+    TEXT_QUEUE = asyncio.Queue()
+    start_stdin_reader(asyncio.get_running_loop(), TEXT_QUEUE)
+
+    await login()
     await register_public_key()
     await connect_with_retry()
 
 if __name__ == "__main__":
     try:
+        # Ask for credentials BEFORE the event loop exists: calling input() or
+        # getpass inside a running asyncio loop can crash the interpreter on Windows.
+        _get_credentials()
         asyncio.run(start_client())
     except KeyboardInterrupt:
         print("\n[Client] Exiting...")

@@ -6,19 +6,39 @@ import uuid
 
 import aio_pika
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.messaging.rabbitmq.connection import rabbitmq_manager
 from app.messaging.redis_client import redis_manager
 from app.models.message import Message
+from app.models.processed_event import ProcessedEvent
 from app.schemas.message import serialize_message
 
 PROCESSING_CLAIM_TTL = 300
-PROCESSED_EVENT_TTL = 86400
 RETRY_COUNTER_TTL = 86400
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 3
+
+
+async def _already_processed(event_id: str) -> bool:
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ProcessedEvent.event_id).where(ProcessedEvent.event_id == uuid.UUID(event_id))
+        )
+        return result.first() is not None
+
+
+async def _record_processed(event_id: str) -> None:
+    """Durably remember a delivered event (idempotent)."""
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            pg_insert(ProcessedEvent)
+            .values(event_id=uuid.UUID(event_id))
+            .on_conflict_do_nothing(index_elements=["event_id"])
+        )
+        await session.commit()
 
 
 async def _release_claim(redis, claim_key: str, token: str) -> None:
@@ -35,32 +55,46 @@ async def _dead_letter(message: aio_pika.abc.AbstractIncomingMessage) -> None:
     await message.nack(requeue=False)
 
 
+# Fallback attempt counter used only while Redis is unreachable, so the retry
+# bound still holds when the shared counter cannot be updated. It is per-process
+# and bounded in size.
+_LOCAL_ATTEMPTS: dict[str, int] = {}
+_LOCAL_ATTEMPTS_MAX = 10_000
+
+
+def _count_local_attempt(event_id: str) -> int:
+    if len(_LOCAL_ATTEMPTS) >= _LOCAL_ATTEMPTS_MAX and event_id not in _LOCAL_ATTEMPTS:
+        _LOCAL_ATTEMPTS.pop(next(iter(_LOCAL_ATTEMPTS)))
+    _LOCAL_ATTEMPTS[event_id] = _LOCAL_ATTEMPTS.get(event_id, 0) + 1
+    return _LOCAL_ATTEMPTS[event_id]
+
+
 async def _retry_or_dead_letter(message, event_id):
-    redis = getattr(redis_manager, "redis", None)
+    redis = redis_manager.redis
+    attempts = None
 
-    if redis is None:
-        await asyncio.sleep(RETRY_DELAY_SECONDS)
-        await message.nack(requeue=True)
-        return
+    if redis is not None:
+        try:
+            retry_key = f"retry_count:{event_id}"
+            attempts = await redis.incr(retry_key)
 
-    try:
-        retry_key = f"retry_count:{event_id}"
-        attempts = await redis.incr(retry_key)
+            if attempts == 1:
+                await redis.expire(retry_key, RETRY_COUNTER_TTL)
+        except Exception as retry_error:
+            print(f"Retry counter unavailable: {retry_error}")
+            attempts = None
 
-        if attempts == 1:
-            await redis.expire(retry_key, RETRY_COUNTER_TTL)
-
-    except Exception as retry_error:
-        print(f"Retry counter unavailable: {retry_error}")
-        await asyncio.sleep(RETRY_DELAY_SECONDS)
-        await message.nack(requeue=True)
-        return
+    if attempts is None:
+        # Fail closed: count locally instead of retrying forever.
+        attempts = _count_local_attempt(event_id)
 
     if attempts <= MAX_RETRIES:
         await asyncio.sleep(RETRY_DELAY_SECONDS)
         await message.nack(requeue=True)
     else:
+        _LOCAL_ATTEMPTS.pop(event_id, None)
         await message.nack(requeue=False)
+
 
 async def on_message(message: aio_pika.abc.AbstractIncomingMessage):
     event_id = None
@@ -106,12 +140,11 @@ async def on_message(message: aio_pika.abc.AbstractIncomingMessage):
             await _dead_letter(message)
             return
 
-        redis = getattr(redis_manager, "redis", None)
+        redis = redis_manager.redis
         if redis is None:
             raise RuntimeError("Redis client is not connected.")
 
-        processed_key = f"processed_event:{event_id}"
-        if await redis.exists(processed_key):
+        if await _already_processed(event_id):
             await message.ack()
             return
 
@@ -142,7 +175,7 @@ async def on_message(message: aio_pika.abc.AbstractIncomingMessage):
                 serialize_message(db_message),
             )
 
-        await redis.set(processed_key, "1", ex=PROCESSED_EVENT_TTL)
+        await _record_processed(event_id)
         await _release_claim(redis, claim_key, claim_token)
         await message.ack()
     except asyncio.CancelledError:
@@ -150,7 +183,7 @@ async def on_message(message: aio_pika.abc.AbstractIncomingMessage):
     except Exception as error:
         print(f"[{settings.SERVER_ID}] Consumer error: {error}")
         if claim_key and claim_token:
-            redis = getattr(redis_manager, "redis", None)
+            redis = redis_manager.redis
             if redis is not None:
                 try:
                     await _release_claim(redis, claim_key, claim_token)

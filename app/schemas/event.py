@@ -17,7 +17,7 @@ class MessageCreatePayload(BaseModel):
     # intentionally exclude message data from here  we use claim check pattern
     # then fetch securely encrypted content from postgresql
 
-class ChatEventEnevelope(BaseModel):
+class ChatEventEnvelope(BaseModel):
     """Standard wrapper for all events entering RabbitMQ"""
 
     # unique id for every event

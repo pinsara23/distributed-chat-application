@@ -1,251 +1,242 @@
-<div align="center">
-
 # Distributed Chat
 
-**A horizontally scalable, real-time chat backend with encrypted messages, presence, and multi-server WebSocket delivery.**
+A distributed, end-to-end encrypted chat backend. Several FastAPI servers share
+PostgreSQL, relay events through RabbitMQ (transactional outbox) and fan messages
+out to the right WebSocket through Redis Pub/Sub. The server only ever stores and
+forwards **ciphertext**.
 
-[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.109-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
-[![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)](https://redis.io/)
-[![Status](https://img.shields.io/badge/status-active%20prototype-f59e0b)](#-why-this-project)
+> **Status:** educational prototype. See [Security limitations](#security-limitations)
+> before using it for anything real.
 
-[Quick start](#-quick-start) · [Architecture](#-architecture) · [API](#-api-at-a-glance) · [Testing](#-testing) · [Contributing](#-contributing)
-
-</div>
-
-> **Project status:** This project is an active distributed-chat prototype. Review and replace the example credentials and secrets before using it outside a local development environment.
-
-## ✨ Why this project?
-
-Distributed Chat demonstrates how to keep real-time conversations available when users are connected to different application nodes:
-
-- **Horizontal scaling** with three FastAPI server replicas behind Nginx.
-- **Cross-node delivery** through Redis Pub/Sub.
-- **Durable messaging** with PostgreSQL and a persist-before-publish flow.
-- **Reliable asynchronous work** through RabbitMQ and an outbox event pipeline.
-- **End-to-end message encryption** using client-side ECDH key agreement and AES-GCM.
-- **Presence tracking** with Redis-backed online/offline state.
-- **Operational visibility** with liveness and readiness endpoints.
-
-## 🚀 Quick start
-
-### Prerequisites
-
-- [Docker Desktop](https://docs.docker.com/desktop/) with Docker Compose
-- Git
-- Python 3.11+ for the local client and test suite
-
-### 1. Configure local secrets
-
-```powershell
-Copy-Item .env.example .env
-```
-
-Open `.env` and replace every placeholder secret. Never commit `.env`, private keys, or production credentials.
-
-### 2. Start the distributed stack
-
-```powershell
-docker compose up -d
-docker compose ps
-```
-
-The Compose stack starts:
-
-| Service | Purpose | Port |
-| --- | --- | ---: |
-| `nginx` | Load balancer and WebSocket proxy | `80` |
-| `postgres` | Durable application data | `5432` |
-| `redis` | Pub/Sub and presence | `6379` |
-| `rabbitmq` | Outbox/event messaging | `5672`, management UI `15672` |
-| `chat_server_1..3` | FastAPI application replicas | internal `8000` |
-| `watchtower` | Updates labeled chat images and removes old images | — |
-
-### 3. Check that the cluster is ready
-
-```powershell
-curl.exe http://localhost/health/live
-curl.exe http://localhost/health/ready
-```
-
-Open the interactive API documentation at [`http://localhost/docs`](http://localhost/docs).
-
-<details>
-<summary><strong>Stop, inspect, or reset the stack</strong></summary>
-
-```powershell
-# Stop containers without removing data
-docker compose stop
-
-# Follow application logs
-docker compose logs -f chat_server_1
-
-# Follow image update logs
-docker compose logs -f watchtower
-
-# Stop and remove containers and volumes
-docker compose down -v
-```
-
-</details>
-
-Watchtower polls Docker Hub every five minutes and updates only services labeled
-`com.centurylinklabs.watchtower.enable=true`. In this stack, that means the three
-chat server replicas; infrastructure services are not updated automatically.
-
-## 🔐 Run the example clients
-
-The repository includes two terminal clients representing User 1 and User 2. Each client:
-
-1. Generates or loads a local key pair.
-2. Registers its public key with the API.
-3. Verifies peers using Trust On First Use (TOFU) fingerprints.
-4. Derives a shared key with ECDH.
-5. Encrypts messages locally before sending them over WebSocket.
-
-Create a Python environment and install the client dependencies:
-
-```powershell
-conda env create -f environment.yml
-conda activate chat-stage2
-pip install -r client\requirements.txt
-pip install -r client_bob\requirements.txt
-```
-
-Before starting the clients, update the token, user IDs, conversation ID, and API URL in:
-
-- [`client/main.py`](client/main.py)
-- [`client_bob/main.py`](client_bob/main.py)
-
-Run them in separate terminals:
-
-```powershell
-python client\main.py
-python client_bob\main.py
-```
-
-The checked-in client files contain placeholder tokens intentionally. Obtain real JWTs through `POST /auth/login`; do not commit real tokens.
-
-## 🧭 Architecture
+## Architecture
 
 ```mermaid
 flowchart LR
-    C1[Client A] <-->|REST + WebSocket| N[Nginx :80]
-    C2[Client B] <-->|REST + WebSocket| N
-    N --> S1[FastAPI node 1]
-    N --> S2[FastAPI node 2]
-    N --> S3[FastAPI node 3]
+    A[Alice client] <-->|REST + WS| N[Nginx - optional]
+    B[Bob client]   <-->|REST + WS| N
+    N --> S1[FastAPI 8001]
+    N --> S2[FastAPI 8002]
+    N --> S3[FastAPI 8003]
     S1 & S2 & S3 --> PG[(PostgreSQL)]
+    S1 & S2 & S3 -->|outbox relay / consume| MQ[(RabbitMQ)]
     S1 & S2 & S3 <-->|Pub/Sub + presence| R[(Redis)]
-    S1 & S2 & S3 -->|Outbox events| MQ[(RabbitMQ)]
-    C1 -.->|E2EE ciphertext| S1
-    C2 -.->|E2EE ciphertext| S3
 ```
 
-### Message delivery path
+| Component | Role | Failure behaviour |
+| --- | --- | --- |
+| **PostgreSQL** | Source of truth: users, conversations, ciphertext messages, outbox, processed events | Writes fail loudly; the sender gets an error, never a false "sent". |
+| **Redis** | Cross-server real-time delivery (Pub/Sub), presence with TTL, in-flight claims | Chat keeps working; the listener resubscribes with backoff; missed live messages are recovered by client sync. |
+| **RabbitMQ** | Reliable hand-off of `message.created` events (retries, dead-letter queue) | The API still starts and accepts messages; events wait in the outbox and are relayed when the broker returns. |
+| **Nginx** | Optional round-robin + WebSocket proxy | A dead server is skipped by Nginx; clients reconnect with backoff. |
+
+### Life of one message (Alice → Bob)
+
+1. Alice's client derives a shared key (X25519 ECDH + HKDF), generates a `message_id` (UUID), builds the
+   AAD and encrypts with AES-GCM. **Plaintext never leaves the client.**
+2. Alice sends `{message_id, conversation_id, target_user_id, ciphertext, nonce, key_version}` over her WebSocket
+   (server A). Unknown fields such as `content` are rejected.
+3. Server A checks both users belong to the conversation, then in **one PostgreSQL transaction** stores the message
+   and a `message.created` outbox event. Only after the commit does anything get published.
+4. Server A echoes the stored message to Alice (her client then stops re-sending it).
+5. The outbox publisher (any server) leases the event, publishes it to RabbitMQ with publisher confirms, then marks it
+   published. No database lock is held while talking to RabbitMQ.
+6. A consumer (any server) takes the event, checks `processed_events` (idempotency), loads the message from PostgreSQL
+   (claim-check: the event carries IDs, not content) and publishes it to Redis channel `chat:user:<bob>`.
+7. Every server hears that channel; the one holding Bob's socket pushes the ciphertext to him. The event is recorded in
+   `processed_events` and the RabbitMQ message is acked.
+8. Bob's client rebuilds the AAD from the envelope, decrypts, and remembers the message id.
+9. If Bob was offline, he calls `GET /conversations/{id}/messages?after_id=…` on reconnect and decrypts what he missed.
+
+### Reliability mechanisms
+
+- **Persist before publish**: the message and its outbox row commit together.
+- **Outbox with leases**: crash-safe, at-least-once relay; multiple publishers never claim the same row (`SKIP LOCKED`).
+- **Idempotent consumer**: durable `processed_events` table + a short Redis claim for in-flight work.
+- **Bounded retries**: 3 attempts, then the event is dead-lettered to `chat.msg.dlq` (also when Redis is down).
+- **Presence**: `presence:user:<id>` with a 30 s TTL refreshed by the client heartbeat (10 s). A crashed server cannot leave
+  anyone online forever; a server only deletes presence it still owns.
+- **Dead connections**: the server drops sockets silent for 45 s.
+- **Client**: re-authenticates on every reconnect, exponential backoff, resends unacknowledged messages
+  (idempotent by `message_id`), syncs missed messages and de-duplicates by message id.
+- **Graceful shutdown**: closes sockets, cancels and *awaits* background tasks, closes RabbitMQ/Redis/DB.
+- **Health**: `/health/live` (process) and `/health/ready` (PostgreSQL + Redis + RabbitMQ).
+
+## End-to-end encryption
+
+| Item | Choice |
+| --- | --- |
+| Identity key | X25519 key pair generated and kept on the client (`<user>_identity.key`, PEM, **not** passphrase-protected) |
+| Key agreement | Static-static ECDH, then HKDF-SHA256 (`info = distributed-chat-e2ee-v1`) |
+| Cipher | AES-256-GCM, random 96-bit nonce per message |
+| Trust | TOFU: the first fingerprint (SHA-256 of the PEM) is stored in `<user>_known_hosts.json`; a changed key triggers a warning and an explicit prompt |
+| Server | Stores public keys only. It validates they are X25519 and bumps `key_version` only when the key really changes |
+
+### Associated data (AAD)
+
+Every message's AES-GCM tag also authenticates a header, so the server (or anyone) cannot move a ciphertext to another
+conversation, claim another sender, replay it under another id, or change the protocol version. It is built by exactly
+one function, `build_aad` in [`client/crypto.py`](client/crypto.py), used by the sender, the receiver and the tests:
 
 ```text
-Client encrypts
-      ↓
-WebSocket receives ciphertext
-      ↓
-PostgreSQL persists message + outbox event
-      ↓
-RabbitMQ processes the outbox
-      ↓
-Redis Pub/Sub fans out to the node holding the recipient connection
-      ↓
-Recipient receives ciphertext and decrypts locally
+dchat-e2ee|v<protocol_version>|<message_id>|<conversation_id>|<sender_id>
+e.g.  dchat-e2ee|v1|3f2b8c1e-5a47-4d0a-9b6e-1c2d3e4f5a6b|7|1
 ```
 
-<details>
-<summary><strong>Key design decisions</strong></summary>
+`message_id` is the lowercase hyphenated UUID; the other fields are base-10 positive integers. No field can contain `|`,
+so the encoding is unambiguous. Changing the layout requires bumping `PROTOCOL_VERSION`. The receiver builds the AAD from
+the envelope fields the server supplies (`message_uuid`, `conversation_id`, `sender_id`), so a lying server causes
+authentication to fail rather than a forged message being accepted.
 
-- **Nginx** uses round-robin routing for REST traffic and preserves the WebSocket upgrade headers.
-- **Redis Pub/Sub** bridges the gap between local WebSocket connection managers on different nodes.
-- **PostgreSQL** is the source of truth; Redis is a transient real-time transport and presence store.
-- **E2EE** keeps plaintext message content on the clients. The server persists and forwards the encrypted envelope.
-- **Health probes** separate process liveness (`/health/live`) from dependency readiness (`/health/ready`).
+### Security limitations
 
-</details>
+- **No forward secrecy / no key ratchet**: the long-term shared key protects every message; compromise of a private key
+  exposes all past and future messages between that pair.
+- **TOFU only**: the first key a client sees is trusted. Compare fingerprints out of band to defeat a malicious server on
+  first contact.
+- **Identity keys are stored unencrypted** on disk.
+- **Metadata is visible to the server**: who talks to whom, when, sizes, presence.
+- **Rotating a key** (`key_version`) is detected by peers (TOFU prompt) but there is no multi-device or key-history support.
+- JWTs travel in the WebSocket query string (access logs may record them). Access tokens are not revocable.
+- Development defaults (JWT secret, passwords) must be replaced before any real deployment.
 
-## 📡 API at a glance
+## Local setup (Windows, no Docker)
 
-All protected endpoints use a JWT bearer token unless noted otherwise.
+PostgreSQL and pgAdmin run on Windows; Redis and RabbitMQ run inside WSL; Python dependencies live in the
+`chat-stage2` conda environment. (The Docker files below are for the server deployment and are not used on this machine.)
+
+```powershell
+conda env create -f environment.yml      # first time only
+conda activate chat-stage2
+Copy-Item .env.example .env              # then edit: passwords, JWT_SECRET_KEY, localhost URLs
+```
+
+`.env` must point `DATABASE_URL` (`postgresql+asyncpg://…@localhost:5432/chat_db`), `REDIS_URL` and `RABBITMQ_URL`
+at your local services. Create the databases, then run the migration:
+
+```powershell
+alembic upgrade head
+```
+
+Start three servers (one terminal each) with distinct ids:
+
+```powershell
+$env:SERVER_ID="chat-server-1"; uvicorn app.main:app --port 8001
+$env:SERVER_ID="chat-server-2"; uvicorn app.main:app --port 8002
+$env:SERVER_ID="chat-server-3"; uvicorn app.main:app --port 8003
+```
+
+Nginx is optional: [`nginx.txt`](nginx.txt) is a local config that balances ports 8001–8003 on `:8000`. Without it,
+connect each client straight to a port.
+
+```powershell
+curl.exe http://localhost:8001/health/ready
+```
+
+### Resetting the development environment
+
+Because the schema is a single initial migration, a reset means dropping and recreating the databases (stop all servers
+first). In `psql` (or pgAdmin's query tool, connected to the `postgres` database):
+
+```sql
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+ WHERE datname IN ('chat_db', 'chat_test_db') AND pid <> pg_backend_pid();
+DROP DATABASE IF EXISTS chat_db;
+DROP DATABASE IF EXISTS chat_test_db;
+CREATE DATABASE chat_db;
+CREATE DATABASE chat_test_db;
+```
+
+Then `alembic upgrade head` (the test database is built by the test suite itself). Also clear transient state that refers
+to the old rows: `redis-cli FLUSHDB`, purge the RabbitMQ queues `chat.message.queue` and `chat.msg.dlq`, and delete the
+clients' `*_message_cursor.json` files.
+
+## Deployment (Docker, server machine)
+
+Pushing to `new-version` runs GitHub Actions: **tests → image build → push** to Docker Hub as
+`<user>/distributed-chat:latest` and `:<commit-sha>`. Nothing is pushed unless the tests (and an
+`alembic check` that the migration matches the models) pass. Repository secrets required:
+`DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`.
+
+On the server, keep `docker-compose.yml`, `nginx/nginx.conf` and a filled-in `.env` (from `.env.example`) in one folder:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Compose starts everything in order: PostgreSQL / Redis / RabbitMQ (healthy) → **`migrate`** (one-shot
+`alembic upgrade head`) → the three chat servers → Nginx. If the migration fails the chat servers are not
+replaced; read why with `docker compose logs migrate`. Only Nginx (port 80) and the RabbitMQ management UI
+(15672) are published; PostgreSQL, Redis and AMQP are internal.
+
+```bash
+docker compose ps                      # everything healthy, migrate "Exited (0)"
+curl http://localhost/health/ready     # PostgreSQL, Redis and RabbitMQ all "ok"
+IMAGE_TAG=<commit-sha> docker compose up -d   # pin or roll back to a specific build
+```
+
+## Running the clients
+
+The same client serves every user; configure it with environment variables (a `CHAT_USER_ID`-based prefix keeps each
+user's key, fingerprints and sync cursor separate). Register users and create a conversation through `/docs`, then:
+
+```powershell
+# Alice (user 1)
+$env:CHAT_USERNAME="alice"; $env:CHAT_PASSWORD="…"; $env:CHAT_USER_ID="1"; $env:CHAT_TARGET_USER_ID="2"
+$env:CHAT_CONVERSATION_ID="1"; $env:CHAT_SERVER_HOST="localhost:8001"; python client\main.py
+
+# Bob (user 2), another terminal
+$env:CHAT_USERNAME="bob"; $env:CHAT_PASSWORD="…"; $env:CHAT_USER_ID="2"; $env:CHAT_TARGET_USER_ID="1"
+$env:CHAT_CONVERSATION_ID="1"; $env:CHAT_SERVER_HOST="localhost:8002"; python client\main.py
+```
+
+Passwords can be omitted to be prompted instead. Never commit `*.key` or `*known_hosts.json` (they are git-ignored).
+
+## API
 
 | Area | Method | Endpoint | Description |
 | --- | :---: | --- | --- |
 | Auth | `POST` | `/auth/register` | Create a user |
-| Auth | `POST` | `/auth/login` | Issue an access token |
-| Conversations | `POST` | `/conversations/` | Create or retrieve a conversation |
-| Conversations | `GET` | `/conversations/` | List the current user's conversations |
-| Messages | `GET` | `/conversations/{id}/messages` | Read paginated message envelopes |
-| Keys | `POST` | `/keys/` | Register or rotate a public key |
-| Keys | `GET` | `/keys/{user_id}` | Retrieve a peer public key |
-| Presence | `GET` | `/users/{user_id}/presence` | Read a user's presence |
-| Health | `GET` | `/health/live` | Fast liveness probe |
-| Health | `GET` | `/health/ready` | PostgreSQL and Redis readiness |
-| Realtime | `WS` | `/ws/chat?token={jwt}` | Send and receive chat events |
+| Auth | `POST` | `/auth/login` | Issue an access token (form fields `username`, `password`) |
+| Conversations | `POST` / `GET` | `/conversations/` | Create-or-get a 1:1 conversation / list mine |
+| Messages | `GET` | `/conversations/{id}/messages` | History: `page`+`limit`, or `after_id` for sync (ciphertext envelopes) |
+| Keys | `POST` | `/keys/` | Register or rotate your X25519 public key |
+| Keys | `GET` | `/keys/{user_id}` | Fetch a peer's public key |
+| Presence | `GET` | `/users/{user_id}/presence` | `online` / `offline` / `unknown` |
+| Health | `GET` | `/health/live`, `/health/ready` | Liveness / dependency readiness |
+| Realtime | `WS` | `/ws/chat?token={jwt}` | Chat frames (below) |
 
-Interactive OpenAPI documentation is available at `/docs`; the raw schema is available at `/openapi.json`.
+WebSocket frames: client → server `{"type":"ping"}` or a message
+`{message_id, conversation_id, target_user_id, ciphertext, nonce, key_version}`; server → client `{"type":"pong"}`, a message
+envelope `{id, message_uuid, conversation_id, sender_id, ciphertext, nonce, key_version, created_at}`, or
+`{"error", "message_id"?, "retryable"?}`.
 
-## 🛠️ Local development
+## Testing
 
-The backend reads configuration from `.env` using Pydantic Settings. For local, non-Docker execution, point `DATABASE_URL`, `SYNC_DATABASE_URL`, `REDIS_URL`, and `RABBITMQ_URL` at services running on `localhost`.
-
-```powershell
-conda activate chat-stage2
-pip install -r requirements.txt
-alembic upgrade head
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-The current Compose file uses the published `pinsara23/distributed-chat:latest` image for the application nodes. If you want to build a new image locally, ensure the image build context includes the dependency file referenced by [`Dockerfile`](Dockerfile) before using a custom build workflow.
-
-## ✅ Testing
-
-The test suite uses `pytest-asyncio` and expects a PostgreSQL test database named `chat_test_db` on the configured local PostgreSQL instance.
+Tests need only the local PostgreSQL (an empty `chat_test_db`); they do not need Redis, RabbitMQ or Docker.
 
 ```powershell
 conda activate chat-stage2
 pytest
 ```
 
-Run a focused test file when iterating:
+They cover the E2EE primitives and AAD binding, the WebSocket handler, the outbox lease SQL and processed-events table
+against real PostgreSQL, the consumer's ack/nack/retry/dead-letter logic, the Redis listener's resubscription, the
+client's sync/dedup/outbound queue, and startup/shutdown behaviour.
 
-```powershell
-pytest tests\test_e2ee.py -q
-pytest tests\test_redis_messaging.py -q
-```
-
-## 📁 Repository map
+## Layout
 
 ```text
 app/
-├── api/             REST endpoints and dependencies
-├── core/            settings, database, encryption, security
-├── messaging/       Redis and RabbitMQ integrations
-├── models/          SQLAlchemy persistence models
-├── presence/        Redis-backed presence service
-├── schemas/         Pydantic request/response models
-├── services/        authentication, chat, key, and health services
-└── websocket/       authenticated real-time chat endpoint
-client/              User 1 encrypted terminal client
-client_bob/          User 2 encrypted terminal client
-alembic/              Database migrations
-nginx/                Reverse proxy and WebSocket configuration
-tests/                Async API, encryption, and messaging tests
+├── api/          REST endpoints and dependencies
+├── core/         settings, database, JWT/password security
+├── messaging/    Redis Pub/Sub, RabbitMQ topology/consumer/outbox publisher/workers
+├── models/       SQLAlchemy models (messages store ciphertext only)
+├── presence/     Redis presence with TTL
+├── schemas/      Pydantic models, incl. the WebSocket message schema
+├── services/     auth, chat, key and health services
+└── websocket/    authenticated chat endpoint + local connection manager
+client/           reference terminal client (E2EE, reconnect, sync, outbound queue)
+alembic/          single initial migration
+tests/            pytest suite
 ```
-
-## 🤝 Contributing
-
-1. Create a focused branch.
-2. Make the smallest complete change.
-3. Add or update tests for behavior changes.
-4. Run `pytest` before opening a pull request.
-5. Document configuration or API changes in this README and the OpenAPI surface.
-
-## 📄 License
-
-No license file is currently included. Add a `LICENSE` file before distributing this project publicly.

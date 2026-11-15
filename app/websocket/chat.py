@@ -1,7 +1,7 @@
 import json
-import binascii
 import jwt
 from pydantic import ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, Query, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
@@ -10,13 +10,15 @@ from app.core.database import get_db
 from app.core.config import settings
 from app.schemas.auth import TokenPayload
 from app.services.chat_service import ChatService
-from app.schemas.message import serialize_message
+from app.schemas.message import WsMessageIn, serialize_message
 from app.messaging.redis_client import redis_manager
 
 # --- STAGE 4: Import the Presence Service ---
 from app.presence.service import presence_service
 
 router = APIRouter()
+
+MAX_WS_MESSAGE_BYTES = 64 * 1024
 
 # --- Connection Manager ---
 class ConnectionManager:
@@ -25,16 +27,32 @@ class ConnectionManager:
 
     async def connect(self, user_id: int, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections[int(user_id)] = websocket
+        safe_id = int(user_id)
+        previous = self.active_connections.get(safe_id)
+        self.active_connections[safe_id] = websocket
         print(f"[{settings.SERVER_ID}] User {user_id} connected locally.")
         await presence_service.mark_online(user_id)
+        if previous is not None and previous is not websocket:
+            # A reconnect replaced a stale socket: close it quietly. Its own
+            # disconnect() call is a no-op because it no longer owns the slot.
+            try:
+                await previous.close(code=1000, reason="Replaced by a newer connection")
+            except Exception:
+                pass
 
-    async def disconnect(self, user_id: int):
+    async def disconnect(self, user_id: int, websocket: WebSocket | None = None):
+        """Remove a connection, but only if `websocket` still owns the slot.
+
+        Without the identity check, a stale socket's cleanup would evict the
+        newer connection and mark the user offline.
+        """
         safe_id = int(user_id)
-        if safe_id in self.active_connections:
-            del self.active_connections[safe_id]
-            print(f"[{settings.SERVER_ID}] User {safe_id} disconnected.")
-            await presence_service.mark_offline(safe_id)
+        current = self.active_connections.get(safe_id)
+        if current is None or (websocket is not None and current is not websocket):
+            return
+        del self.active_connections[safe_id]
+        print(f"[{settings.SERVER_ID}] User {safe_id} disconnected.")
+        await presence_service.mark_offline(safe_id)
 
     async def send_personal_message(self, message: str, target_user_id: int):
         safe_target = int(target_user_id)
@@ -42,8 +60,8 @@ class ConnectionManager:
             websocket = self.active_connections[safe_target]
             await websocket.send_text(message)
             print(f"[{settings.SERVER_ID}] Delivered message to local User {safe_target}.")
-        else:
-            print(f"DEBUG MANAGER: -> FAILED! User {safe_target} not found in dictionary!")
+        # else: the recipient is connected to another server (every server hears
+        # every Redis channel), which is normal and not worth logging.
 
 
     async def close_all(self):
@@ -91,67 +109,76 @@ async def websocket_endpoint(
                 print(f"[{settings.SERVER_ID}] User {user_id} timed out (Ghost Connection). Forcing disconnect.")
                 break 
             
+            if len(data.encode("utf-8")) > MAX_WS_MESSAGE_BYTES:
+                await websocket.send_text(json.dumps({"error": "Message too large."}))
+                continue
+
             try:
                 payload = json.loads(data)
             except json.JSONDecodeError:
-                print(f"[{settings.SERVER_ID}] Invalid JSON received: {data}")
+                print(f"[{settings.SERVER_ID}] Invalid JSON received.")
                 await websocket.send_text(json.dumps({"error": "Message must be valid JSON."}))
                 continue 
+
+            if not isinstance(payload, dict):
+                await websocket.send_text(json.dumps({"error": "Message must be a JSON object."}))
+                continue
             
             if payload.get("type") == "ping":
                 await presence_service.refresh_presence(user_id) 
                 await websocket.send_text(json.dumps({"type": "pong"}))
                 continue
             
-            # --- E2EE CHAT MESSAGE VALIDATION ---
-            if "conversation_id" not in payload or "target_user_id" not in payload:
-                await websocket.send_text(json.dumps({"error": "Missing conversation_id or target_user_id."}))
+            # Plaintext is never accepted: WsMessageIn forbids unknown fields
+            # and requires well-formed ciphertext + nonce.
+            try:
+                incoming = WsMessageIn.model_validate(payload)
+            except ValidationError as exc:
+                first = exc.errors()[0]
+                field = ".".join(str(part) for part in first["loc"]) or "message"
+                await websocket.send_text(json.dumps({"error": f"Invalid message: {field}: {first['msg']}"}))
                 continue
-                
-            # Allow BOTH E2EE (cipertext) and Stage 3 (content) payloads for backwards compatibility
-            has_e2ee = "cipertext" in payload and "nonce" in payload
-            has_stage3 = "content" in payload
 
-            if not has_e2ee and not has_stage3:
-                await websocket.send_text(json.dumps({"error": "Message must contain either 'cipertext' and 'nonce' (E2EE), or 'content' (Legacy)."}))
-                continue
-                
-            conv_id = int(payload.get("conversation_id"))
-            target_id = int(payload.get("target_user_id"))
-            
-            # 4. Save to PostgreSQL AND Outbox
-            # Note: We must update chat_service.save_message next to handle these new fields!
             try:
                 saved_msg = await chat_service.save_message(
-                    conversation_id=conv_id,
+                    conversation_id=incoming.conversation_id,
                     sender_id=user_id,
-                    target_id=target_id,
-                    content=payload.get("content"), # Will be None if E2EE
-                    cipertext=payload.get("cipertext"),
-                    nonce=payload.get("nonce"),
-                    key_version=payload.get("key_version", 1)
+                    target_id=incoming.target_user_id,
+                    message_uuid=incoming.message_id,
+                    ciphertext=incoming.ciphertext_bytes,
+                    nonce=incoming.nonce_bytes,
+                    key_version=incoming.key_version,
                 )
             except HTTPException as exc:
-                await websocket.send_text(json.dumps({"error": exc.detail}))
+                await websocket.send_text(json.dumps({
+                    "error": exc.detail,
+                    "message_id": str(incoming.message_id),
+                    "retryable": False,
+                }))
                 continue
-            except (ValueError, binascii.Error):
-                await websocket.send_text(json.dumps({"error": "Invalid message encoding."}))
+            except SQLAlchemyError as exc:
+                # Nothing was committed, so never report success.
+                print(f"[{settings.SERVER_ID}] Database error saving message: {exc}")
+                await db.rollback()
+                await websocket.send_text(json.dumps({
+                    "error": "Message could not be saved. Please retry.",
+                    "message_id": str(incoming.message_id),
+                    "retryable": True,
+                }))
                 continue
-            
-            # 5. Prepare the outgoing message JSON (E2EE Envelope!)
+
             outbound_msg = serialize_message(saved_msg)
 
-            # Attach E2EE or Legacy fields depending on what was saved
-            if payload.get("cipertext"):
-                outbound_msg["cipertext"] = payload.get("cipertext")
-                outbound_msg["nonce"] = payload.get("nonce")
-            else:
-                outbound_msg["content"] = payload.get("content")
-            
-            # 6. Echo back to sender instantly via Redis
-            await redis_manager.publish_message(user_id, outbound_msg)
+            # 6. Echo back to sender. The message is already durable, so a Redis
+            # outage must not kill the socket: fall back to the local socket
+            # (the sender is connected to this very server).
+            try:
+                await redis_manager.publish_message(user_id, outbound_msg)
+            except Exception as exc:
+                print(f"[{settings.SERVER_ID}] Redis echo failed ({exc}); echoing locally.")
+                await websocket.send_text(json.dumps(outbound_msg))
             
     except WebSocketDisconnect:
         print(f"[{settings.SERVER_ID}] User {user_id} disconnected normally.")
     finally:
-        await manager.disconnect(user_id)
+        await manager.disconnect(user_id, websocket)

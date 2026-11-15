@@ -14,7 +14,11 @@ class KeyService:
         existing_key = resullt.scalar_one_or_none()
 
         if existing_key:
-            # Update the existing key and increment the version
+            if existing_key.public_key_pem.strip() == public_key_pem.strip():
+                # Same key re-uploaded (e.g. client restart): not a key change,
+                # so do not bump the version or peers would see false rotations.
+                return existing_key
+            # A different key: update it and increment the version
             existing_key.public_key_pem = public_key_pem
             existing_key.key_version += 1
             db_key = existing_key

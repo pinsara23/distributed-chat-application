@@ -1,13 +1,18 @@
-__pycache__/
-*.py[cod]
-*$py.class
-.env
-.git/
-client/
-client_bob/
-tests/
-*.key
-*known_hosts.json
-venv/
-env/
-.venv/
+# Allow-list: nothing is sent to the Docker build unless it is listed here, so
+# .env, keys, state files, docs and tests can never end up in the image.
+*
+
+!requirements.txt
+!app/
+!alembic/
+!alembic.ini
+
+# Even inside allowed folders, never include these (patterns apply at any depth).
+**/__pycache__
+**/*.py[cod]
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+**/*known_hosts.json
+**/*_message_cursor.json

@@ -1,14 +1,14 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 from fastapi import HTTPException, status
-import base64
+from sqlalchemy.exc import IntegrityError
+import uuid
 
 from app.models.user import User
 from app.models.conversation import Conversation, ConversationParticipant
 from app.models.message import Message
 from app.models.outbox_events import OutboxEvent
-from app.schemas.event import ChatEventEnevelope, MessageCreatePayload
-from app.core.encryption import encryption_service
+from app.schemas.event import ChatEventEnvelope, MessageCreatePayload
 from app.core.config import settings
 
 class ChatService:
@@ -138,68 +138,85 @@ class ChatService:
             )
 
     async def save_message(
-        self, 
-        conversation_id: int, 
-        sender_id: int, 
-        target_id: int, 
-        content: str = None, 
-        cipertext: str = None, 
-        nonce: str = None, 
-        key_version: int = 1
+        self,
+        conversation_id: int,
+        sender_id: int,
+        target_id: int,
+        message_uuid: uuid.UUID,
+        ciphertext: bytes,
+        nonce: bytes,
+        key_version: int = 1,
     ) -> Message:
+        """Persist an E2EE message and its outbox event in one transaction.
+
+        ``message_uuid`` is chosen by the sender, which makes this idempotent:
+        re-sending the same message (e.g. after a reconnect) returns the stored
+        row instead of creating a duplicate.
+        """
         await self._ensure_message_authorized(
             conversation_id=conversation_id,
             sender_id=sender_id,
             target_id=target_id,
         )
-        
-        # --- STAGE 4 E2EE INTEGRATION ---
-        # If the client sent E2EE ciphertext, we save it directly (converting the Base64 string to bytes for the DB).
-        if cipertext and nonce:
-            final_cipher = base64.b64decode(cipertext, validate=True)
-            final_nonce = base64.b64decode(nonce, validate=True)
-            final_version = key_version
-        
-        # --- STAGE 3 LEGACY FALLBACK ---
-        # If the client sent plaintext content, encrypt it using the server key like we used to.
-        elif content:
-            final_cipher, final_nonce, final_version = encryption_service.encrypt(content)
-        else:
-            raise ValueError("Message must contain either 'cipertext' or 'content'")
+
+        existing = await self._get_by_uuid(message_uuid)
+        if existing is not None:
+            return self._check_same_message(existing, conversation_id, sender_id)
 
         new_message = Message(
+            message_uuid=message_uuid,
             conversation_id=conversation_id,
             sender_id=sender_id,
-            cipertext=final_cipher,
-            nonce=final_nonce,
-            encryption_version=final_version,
+            ciphertext=ciphertext,
+            nonce=nonce,
+            key_version=key_version,
         )
-
         self.db.add(new_message)
-        await self.db.flush() 
-        
+
+        try:
+            await self.db.flush()
+        except IntegrityError:
+            # Lost a race with a concurrent send of the same message_uuid.
+            await self.db.rollback()
+            existing = await self._get_by_uuid(message_uuid)
+            if existing is None:
+                raise
+            return self._check_same_message(existing, conversation_id, sender_id)
+
         payload = MessageCreatePayload(
             message_id=new_message.message_uuid,
             conversation_id=new_message.conversation_id,
             sender_id=new_message.sender_id,
-            target_user_id=target_id
+            target_user_id=target_id,
         )
-
-        enevelope = ChatEventEnevelope(
+        envelope = ChatEventEnvelope(
             event_type="message.created",
             producer=settings.SERVER_ID,
-            payload=payload
+            payload=payload,
         )
-
-        outbox_event = OutboxEvent(
-            event_id=enevelope.event_id,
-            event_type=enevelope.event_type,
-            payload=enevelope.model_dump(mode="json")
+        self.db.add(
+            OutboxEvent(
+                event_id=envelope.event_id,
+                event_type=envelope.event_type,
+                payload=envelope.model_dump(mode="json"),
+            )
         )
-
-        self.db.add(outbox_event)
 
         await self.db.commit()
         await self.db.refresh(new_message)
-        
         return new_message
+
+    async def _get_by_uuid(self, message_uuid: uuid.UUID) -> Message | None:
+        result = await self.db.execute(
+            select(Message).where(Message.message_uuid == message_uuid)
+        )
+        return result.scalars().first()
+
+    @staticmethod
+    def _check_same_message(existing: Message, conversation_id: int, sender_id: int) -> Message:
+        if existing.sender_id != sender_id or existing.conversation_id != conversation_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="message_id is already in use.",
+            )
+        return existing

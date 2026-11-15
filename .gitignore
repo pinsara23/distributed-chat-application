@@ -5,6 +5,8 @@ env/
 
 # Environment Variables
 .env
+.env.*
+!.env.example
 
 # Python Caches
 __pycache__/
@@ -24,8 +26,38 @@ htmlcov/
 
 # Local Cryptography & Client State (CRITICAL)
 *.key
-known_hosts.json
-bob_known_hosts.json
+*known_hosts.json
 client_bob/
 dockerhub.txt
 backups/
+*_message_cursor.json
+*_identity.key
+*_known_hosts.json
+client_*/
+
+# Python build / tooling caches
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+coverage.xml
+
+# Logs & local DB files
+*.log
+*.sqlite3
+
+# Claude Code local settings
+.claude/settings.local.json
+
+stage3_prompt.txt
+stage4_prompt.txt
+text.txt
+nginx.txt
+FULL_UPGRADE_PLAN.txt
+dockerhub.txt
+
+CLAUDE.md
+docs/
+
+

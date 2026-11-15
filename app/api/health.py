@@ -10,7 +10,7 @@ def get_health_service(db: AsyncSession = Depends(get_db)) -> HealthService:
 
 @router.get("/live", status_code=status.HTTP_200_OK)
 async def liveness_check():
-    """"Liveness probe fast not dependencies"""
+    """Liveness probe: fast, no dependencies."""
     return {"status": "alive"}
 
 @router.get("/ready", status_code=status.HTTP_200_OK)
@@ -20,13 +20,15 @@ async def readiness_check(health_service: HealthService = Depends(get_health_ser
 
     db_ok, db_msg = await health_service.check_database()
     redis_ok, redis_msg = await health_service.check_redis()
+    rabbit_ok, rabbit_msg = await health_service.check_rabbitmq()
 
-    is_ready = db_ok and redis_ok
+    is_ready = db_ok and redis_ok and rabbit_ok
 
     health_status = {
         "status": "ready" if is_ready else "not ready",
         "database": db_msg,
-        "redis": redis_msg
+        "redis": redis_msg,
+        "rabbitmq": rabbit_msg,
     }
     if not is_ready:
         raise HTTPException(

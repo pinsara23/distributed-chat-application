@@ -12,6 +12,14 @@ from app.schemas.message import serialize_message
 from app.services.chat_service import ChatService
 
 
+ENVELOPE = dict(
+    message_uuid=uuid.uuid4(),
+    ciphertext=b"c" * 32,
+    nonce=b"n" * 12,
+    key_version=1,
+)
+
+
 class ScalarResult:
     def __init__(self, values):
         self.values = values
@@ -32,7 +40,9 @@ class FakeSession:
         self.added = []
         self.committed = False
 
-    async def execute(self, _statement):
+    async def execute(self, statement):
+        if "FROM messages" in str(statement):  # idempotency lookup: no existing row
+            return ScalarResult([])
         return ScalarResult(self.participant_ids)
 
     def add(self, value):
@@ -58,15 +68,15 @@ def test_binary_message_fields_are_serialized_as_base64():
         message_uuid=uuid.uuid4(),
         conversation_id=2,
         sender_id=3,
-        cipertext=b"\x00\xffcipher",
+        ciphertext=b"\x00\xffcipher",
         nonce=b"\x01\x02",
-        encryption_version=1,
+        key_version=1,
         created_at=datetime(2026, 1, 1),
     )
 
     serialized = serialize_message(message)
 
-    assert serialized["cipertext"] == base64.b64encode(message.cipertext).decode("ascii")
+    assert serialized["ciphertext"] == base64.b64encode(message.ciphertext).decode("ascii")
     assert serialized["nonce"] == base64.b64encode(message.nonce).decode("ascii")
 
 
@@ -79,7 +89,7 @@ async def test_participant_can_send_and_creates_message_and_outbox():
         conversation_id=5,
         sender_id=10,
         target_id=20,
-        content="hello",
+        **ENVELOPE,
     )
 
     assert saved.sender_id == 10
@@ -97,7 +107,7 @@ async def test_non_participant_cannot_send_and_creates_no_records():
             conversation_id=5,
             sender_id=10,
             target_id=30,
-            content="must fail",
+            **ENVELOPE,
         )
 
     assert exc_info.value.status_code == 403

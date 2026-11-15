@@ -61,13 +61,20 @@ class RabbitMqConnectionManager:
 
         print(f"[{settings.SERVER_ID}] RabbitMQ topology setup complete (DLQ active).")
     
+    def is_connected(self) -> bool:
+        return self.connection is not None and not self.connection.is_closed
+
     async def disconnect(self):
-       """Colse the channels and connections"""
-       if self.channel and not self.channel.is_closed:
-        await self.channel.close()
-       
-       if self.connection and not self.connection.is_closed:
-        await self.connection.close() 
+        """Close the channel and connection, ignoring errors from a dead broker."""
+        for resource in (self.channel, self.connection):
+            if resource is not None and not resource.is_closed:
+                try:
+                    await resource.close()
+                except Exception:
+                    pass
+        self.channel = None
+        self.connection = None
+        self.exchange = None
 
 
 rabbitmq_manager = RabbitMqConnectionManager()

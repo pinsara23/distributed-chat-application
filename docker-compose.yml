@@ -1,16 +1,62 @@
+# Deploy with:   docker compose pull && docker compose up -d
+# Roll back with: IMAGE_TAG=<commit-sha> docker compose up -d
+#
+# Startup order (everything waits for the previous stage to be healthy):
+#   postgres, redis, rabbitmq  ->  migrate (one-shot)  ->  chat_server_1..3  ->  nginx
+#
+# Only nginx (80) and the RabbitMQ management UI (15672) are published to the
+# host. PostgreSQL, Redis and the AMQP port are reachable only on the internal
+# compose network.
+
+# ----------------------------------------------------------------------------
+# Shared settings
+# ----------------------------------------------------------------------------
+x-app-image: &app-image
+  image: pinsara23/distributed-chat:${IMAGE_TAG:-latest}
+  env_file:
+    - .env
+
+# Connection strings use the compose service names. They override whatever .env
+# says (a local-development .env points at localhost), so one .env works for both.
+x-app-env: &app-env
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-chat_db}
+  REDIS_URL: redis://redis:6379/0
+  RABBITMQ_URL: amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}@rabbitmq:5672/
+
+x-chat-server: &chat-server
+  <<: *app-image
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
+  healthcheck:
+    # The slim image has no curl, so use Python.
+    test:
+      - CMD
+      - python
+      - -c
+      - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=3)"
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 20s
 
 services:
-  # ----------------------------------------
-  # Primary PostgreSQL Database
-  # ----------------------------------------
+  # --------------------------------------------------------------------------
+  # Infrastructure (no published ports)
+  # --------------------------------------------------------------------------
   postgres:
     image: postgres:15-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-admin}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-chat_db}
-    ports:
-      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -19,18 +65,45 @@ services:
         - pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 10s
     restart: unless-stopped
 
-  # ----------------------------------------
-  # Automated PostgreSQL Backup
-  # ----------------------------------------
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-admin}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
+    ports:
+      - "15672:15672"   # management UI only; AMQP (5672) stays internal
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      # Pings the node itself, not just the TCP port.
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
   postgres_backup:
     image: postgres:15-alpine
     environment:
       PGHOST: postgres
       PGUSER: ${POSTGRES_USER:-admin}
-      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       PGDATABASE: ${POSTGRES_DB:-chat_db}
       BACKUP_INTERVAL_SECONDS: 86400
     volumes:
@@ -65,145 +138,72 @@ services:
         done
     restart: unless-stopped
 
-  # ----------------------------------------
-  # Redis
-  # ----------------------------------------
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    restart: unless-stopped
-
-  # ----------------------------------------
-  # RabbitMQ
-  # ----------------------------------------
-  rabbitmq:
-    image: rabbitmq:3-management-alpine
+  # --------------------------------------------------------------------------
+  # Database migration: runs once per `up`, before any chat server starts.
+  # If it fails, the chat servers are not (re)created and keep running the
+  # previous version. Check it with: docker compose logs migrate
+  # --------------------------------------------------------------------------
+  migrate:
+    <<: *app-image
+    command: ["alembic", "upgrade", "head"]
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-admin}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
-    ports:
-      - "5672:5672"
-      - "15672:15672"
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-    healthcheck:
-      test:
-        - CMD
-        - rabbitmq-diagnostics
-        - check_port_connectivity
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
-  # ----------------------------------------
-  # Chat Server 1
-  # ----------------------------------------
+  # --------------------------------------------------------------------------
+  # Chat servers
+  # --------------------------------------------------------------------------
   chat_server_1:
-    image: pinsara23/distributed-chat:latest
-    labels:
-      - com.centurylinklabs.watchtower.enable=true
-    env_file:
-      - .env
+    <<: *chat-server
     environment:
+      <<: *app-env
       SERVER_ID: chat-server-1
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_db}
-      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_db}
-      REDIS_URL: redis://redis:6379/0
-      RABBITMQ_URL: amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-    restart: unless-stopped
 
-  # ----------------------------------------
-  # Chat Server 2
-  # ----------------------------------------
   chat_server_2:
-    image: pinsara23/distributed-chat:latest
-    labels:
-      - com.centurylinklabs.watchtower.enable=true
-    env_file:
-      - .env
+    <<: *chat-server
     environment:
+      <<: *app-env
       SERVER_ID: chat-server-2
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_db}
-      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_db}
-      REDIS_URL: redis://redis:6379/0
-      RABBITMQ_URL: amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-    restart: unless-stopped
 
-  # ----------------------------------------
-  # Chat Server 3
-  # ----------------------------------------
   chat_server_3:
-    image: pinsara23/distributed-chat:latest
-    labels:
-      - com.centurylinklabs.watchtower.enable=true
-    env_file:
-      - .env
+    <<: *chat-server
     environment:
+      <<: *app-env
       SERVER_ID: chat-server-3
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_db}
-      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_db}
-      REDIS_URL: redis://redis:6379/0
-      RABBITMQ_URL: amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-    restart: unless-stopped
 
-  # ----------------------------------------
-  # Nginx Load Balancer
-  # ----------------------------------------
+  # --------------------------------------------------------------------------
+  # Nginx load balancer: the only public entry point
+  # --------------------------------------------------------------------------
   nginx:
-    image: nginx:alpine
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    image: nginx:1.27-alpine
     ports:
       - "80:80"
-    depends_on:
-      - chat_server_1
-      - chat_server_2
-      - chat_server_3
-    restart: unless-stopped
-
-  # ----------------------------------------
-  # Watchtower - Automatic Image Updates
-  # ----------------------------------------
-  watchtower:
-    image: containrrr/watchtower:latest
-    command: --label-enable --interval 300 --cleanup
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      # `restart: true` restarts nginx whenever compose recreates a chat server.
+      # nginx resolves upstream hostnames only at startup, so without this it
+      # would keep sending traffic to a container's old IP after an update.
+      chat_server_1:
+        condition: service_healthy
+        restart: true
+      chat_server_2:
+        condition: service_healthy
+        restart: true
+      chat_server_3:
+        condition: service_healthy
+        restart: true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
 
-# ----------------------------------------
-# Persistent Volumes
-# ----------------------------------------
 volumes:
   postgres_data:
   redis_data:

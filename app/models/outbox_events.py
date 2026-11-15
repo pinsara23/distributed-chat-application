@@ -14,13 +14,21 @@ If it fails, it will retry until it succeeds. Once it succeeds, it will delete t
 
 import uuid
 from datetime import datetime
-from sqlalchemy import String, DateTime, JSON
+from sqlalchemy import DateTime, Index, JSON, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
 
 class OutboxEvent(Base):
     __tablename__ = "outbox_events"
+    __table_args__ = (
+        # The publisher only ever scans rows that are still unpublished.
+        Index(
+            "ix_outbox_events_unpublished",
+            "created_at",
+            postgresql_where=text("published_at IS NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
@@ -41,3 +49,7 @@ class OutboxEvent(Base):
 
 # when it was successfully published to RabbitMQ (None - not yet published)
     published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # Claim lease: a publisher sets this while it works on the row. If that
+    # server dies, the lease expires and another publisher retries the event.
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

@@ -1,4 +1,3 @@
-import asyncio
 import json
 import uuid
 from datetime import datetime
@@ -84,6 +83,22 @@ class FakeExchange:
         self.messages.append((message, routing_key, mandatory))
 
 
+@pytest.fixture(autouse=True)
+def processed_store(monkeypatch):
+    """In-memory stand-in for the processed_events table."""
+    store = set()
+
+    async def already(event_id):
+        return event_id in store
+
+    async def record(event_id):
+        store.add(event_id)
+
+    monkeypatch.setattr(consumer, "_already_processed", already)
+    monkeypatch.setattr(consumer, "_record_processed", record)
+    return store
+
+
 def event(event_id=None):
     event_id = event_id or uuid.uuid4()
     return SimpleNamespace(
@@ -111,51 +126,91 @@ def rabbit_message(envelope):
     return message
 
 
+def claimed(n=1):
+    return [
+        publisher.ClaimedEvent(i, uuid.uuid4(), "message.created", {"payload": {}})
+        for i in range(1, n + 1)
+    ]
+
+
+@pytest.fixture
+def outbox_calls(monkeypatch):
+    calls = SimpleNamespace(marked=[], released=[])
+
+    async def mark(row_id):
+        calls.marked.append(row_id)
+
+    async def release(ids):
+        calls.released.extend(ids)
+
+    monkeypatch.setattr(publisher, "_mark_published", mark)
+    monkeypatch.setattr(publisher, "_release", release)
+    return calls
+
+
 @pytest.mark.asyncio
-async def test_concurrent_outbox_publishers_claim_distinct_events(monkeypatch):
-    events = [event(), event()]
+async def test_outbox_publishes_then_marks_each_event(monkeypatch, outbox_calls):
     exchange = FakeExchange()
-    statements = []
-
-    class ConcurrentSession(FakePublisherSession):
-        def __init__(self):
-            super().__init__(events.pop(0) if events else None)
-
-        async def execute(self, statement):
-            statements.append(statement)
-            return await super().execute(statement)
-
     monkeypatch.setattr(publisher.rabbitmq_manager, "exchange", exchange)
-    monkeypatch.setattr(publisher, "AsyncSessionLocal", ConcurrentSession)
 
-    assert await asyncio.gather(
-        publisher.publish_outbox_batch(),
-        publisher.publish_outbox_batch(),
-    ) == [1, 1]
-    assert len(exchange.messages) == 2
-    assert all(statement._for_update_arg.skip_locked for statement in statements)
+    async def claim(_size):
+        return claimed(3)
+
+    monkeypatch.setattr(publisher, "_claim_batch", claim)
+
+    assert await publisher.publish_outbox_batch() == 3
+    assert [m[1] for m in exchange.messages] == ["message.created"] * 3
+    assert all(m[2] is True for m in exchange.messages)  # mandatory
+    assert outbox_calls.marked == [1, 2, 3]
+    assert outbox_calls.released == []
 
 
 @pytest.mark.asyncio
-async def test_outbox_failure_leaves_event_pending(monkeypatch):
-    outbox_event = event()
+async def test_outbox_failure_marks_nothing_and_releases_the_claim(monkeypatch, outbox_calls):
     exchange = FakeExchange()
     exchange.fail = True
-
     monkeypatch.setattr(publisher.rabbitmq_manager, "exchange", exchange)
-    monkeypatch.setattr(
-        publisher,
-        "AsyncSessionLocal",
-        lambda: FakePublisherSession(outbox_event),
-    )
+
+    async def claim(_size):
+        return claimed(2)
+
+    monkeypatch.setattr(publisher, "_claim_batch", claim)
 
     with pytest.raises(RuntimeError, match="broker unavailable"):
         await publisher.publish_outbox_batch()
-    assert outbox_event.published_at is None
+
+    assert outbox_calls.marked == []
+    assert outbox_calls.released == [1, 2]
 
 
 @pytest.mark.asyncio
-async def test_consumer_success_and_duplicate_delivery(monkeypatch):
+async def test_outbox_partial_failure_keeps_confirmed_events_published(monkeypatch, outbox_calls):
+    """Event 1 is confirmed; event 2 fails. Only 2 and 3 go back to the queue."""
+    exchange = FakeExchange()
+    real_publish = exchange.publish
+
+    async def flaky(message, routing_key, mandatory):
+        if len(exchange.messages) == 1:
+            raise RuntimeError("broker unavailable")
+        await real_publish(message, routing_key, mandatory)
+
+    exchange.publish = flaky
+    monkeypatch.setattr(publisher.rabbitmq_manager, "exchange", exchange)
+
+    async def claim(_size):
+        return claimed(3)
+
+    monkeypatch.setattr(publisher, "_claim_batch", claim)
+
+    with pytest.raises(RuntimeError):
+        await publisher.publish_outbox_batch()
+
+    assert outbox_calls.marked == [1]
+    assert outbox_calls.released == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_consumer_success_and_duplicate_delivery(monkeypatch, processed_store):
     redis = FakeRedis()
     message_uuid = uuid.uuid4()
     db_message = SimpleNamespace(
@@ -163,9 +218,9 @@ async def test_consumer_success_and_duplicate_delivery(monkeypatch):
         message_uuid=message_uuid,
         conversation_id=2,
         sender_id=3,
-        cipertext=b"ciphertext",
+        ciphertext=b"ciphertext",
         nonce=b"nonce",
-        encryption_version=1,
+        key_version=1,
         created_at=datetime.utcnow(),
     )
     envelope = {
@@ -193,11 +248,11 @@ async def test_consumer_success_and_duplicate_delivery(monkeypatch):
     first.ack.assert_awaited_once()
     second.ack.assert_awaited_once()
     redis_manager.publish_message.assert_awaited_once()
-    assert redis.values[f"processed_event:{envelope['event_id']}"] == "1"
+    assert envelope["event_id"] in processed_store
 
 
 @pytest.mark.asyncio
-async def test_consumer_retries_missing_database_message_then_dead_letters(monkeypatch):
+async def test_consumer_retries_missing_database_message_then_dead_letters(monkeypatch, processed_store):
     redis = FakeRedis()
     monkeypatch.setattr(redis_manager, "redis", redis)
     monkeypatch.setattr(
@@ -222,7 +277,7 @@ async def test_consumer_retries_missing_database_message_then_dead_letters(monke
     for message in messages[:3]:
         message.nack.assert_awaited_once_with(requeue=True)
     messages[3].nack.assert_awaited_once_with(requeue=False)
-    assert not any(key.startswith("processed_event:") for key in redis.values)
+    assert not processed_store
 
 
 @pytest.mark.asyncio
@@ -243,12 +298,34 @@ async def test_consumer_malformed_event_is_dead_lettered(monkeypatch):
 @pytest.mark.asyncio
 async def test_redis_publish_errors_propagate():
     manager = RedisPubSubManager()
-    manager.redis_client = AsyncMock()
-    manager.redis_client.publish.side_effect = RuntimeError("redis unavailable")
+    manager.redis = AsyncMock()
+    manager.redis.publish.side_effect = RuntimeError("redis unavailable")
 
     with pytest.raises(RuntimeError, match="redis unavailable"):
         await manager.publish_message(5, {"id": 1})
 
-    manager.redis_client = None
+    manager.redis = None
     with pytest.raises(RuntimeError, match="not connected"):
         await manager.publish_message(5, {"id": 1})
+
+
+@pytest.mark.asyncio
+async def test_retry_bound_holds_when_redis_is_down(monkeypatch):
+    """With Redis unavailable the event must still be dead-lettered, not looped."""
+    monkeypatch.setattr(redis_manager, "redis", None)
+    monkeypatch.setattr(consumer, "RETRY_DELAY_SECONDS", 0)
+    consumer._LOCAL_ATTEMPTS.clear()
+    envelope = {
+        "event_id": str(uuid.uuid4()),
+        "event_type": "message.created",
+        "payload": {"message_id": str(uuid.uuid4()), "target_user_id": 7},
+    }
+
+    messages = [rabbit_message(envelope) for _ in range(consumer.MAX_RETRIES + 1)]
+    for message in messages:
+        await consumer.on_message(message)
+
+    for message in messages[:-1]:
+        message.nack.assert_awaited_once_with(requeue=True)
+    messages[-1].nack.assert_awaited_once_with(requeue=False)
+    assert envelope["event_id"] not in consumer._LOCAL_ATTEMPTS

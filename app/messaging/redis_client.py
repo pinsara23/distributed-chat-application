@@ -1,89 +1,104 @@
-"""
-Why Pub/Sub?
-Because Server 1 has no access to Server 3's memory, 
-it cannot deliver a message to Bob directly. Instead, Server 1 will act as a Publisher and shout into Redis: 
-"I have a message for User ID 35!"
+"""Redis Pub/Sub fan-out between chat servers.
 
-Simultaneously, Server 1, Server 2, and Server 3 are all acting as Subscribers, 
-constantly listening to Redis. When they hear the shout, they check their own local memory. 
-Only the server that currently holds Bob's WebSocket will actually push the message to him.
+Server 1 cannot reach a WebSocket held by Server 3, so it publishes
+"message for user 35" to Redis. Every server subscribes to every user channel
+(``chat:user:*``) and only the one that holds that user's socket delivers it.
 """
 
-import json
 import asyncio
+import json
+
 import redis.asyncio as redis
+
 from app.core.config import settings
+
+CHANNEL_PATTERN = "chat:user:*"
+RESUBSCRIBE_MIN_DELAY = 1.0
+RESUBSCRIBE_MAX_DELAY = 30.0
+
 
 class RedisPubSubManager:
     def __init__(self):
-        self.redis_client = None
         self.redis = None
-        self.pubsub = None  # This must exist!
+        self.pubsub = None
 
     async def connect(self):
-        # 1. Connect to the main Redis client
-        self.redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
-        self.redis = self.redis_client  # Expose the Redis client for other modules to use
-
-        # 2. Initialize the pubsub attribute (THIS IS WHAT CRASHED YOUR APP)
-        self.pubsub = self.redis_client.pubsub()
+        # health_check_interval makes redis-py PING idle connections, so a
+        # silently dead subscriber connection is noticed and re-established.
+        self.redis = redis.from_url(
+            settings.REDIS_URL,
+            decode_responses=True,
+            health_check_interval=15,
+        )
         print(f"[{settings.SERVER_ID}] connected to redis.")
 
     async def disconnect(self):
         if self.pubsub:
             await self.pubsub.aclose()
-        if self.redis_client:
-            await self.redis_client.aclose()
+            self.pubsub = None
+        if self.redis:
+            await self.redis.aclose()
 
     async def publish_message(self, target_user_id: int, message_payload: dict):
-        """Publishes a message payload to a specific user's Redis channel."""
-        channel = f"chat:user:{target_user_id}"
-        if self.redis_client is None:
+        """Publish a message payload to a specific user's Redis channel."""
+        if self.redis is None:
             raise RuntimeError("Redis client is not connected.")
 
-        await self.redis_client.publish(channel, json.dumps(message_payload))
-        print(f"[{settings.SERVER_ID}] Published event to {channel}")
+        channel = f"chat:user:{target_user_id}"
+        await self.redis.publish(channel, json.dumps(message_payload))
+
+    def _new_pubsub(self):
+        return self.redis.pubsub()
 
     async def subscribe_and_listen(self, local_websocket_manager):
-        """Listens for cross-server messages and attempts local delivery."""
-        try:
-            print(f"[{settings.SERVER_ID}] Attempting to start Redis listener...")
-            
-            await self.pubsub.psubscribe("chat:user:*")
-            print(f"[{settings.SERVER_ID}] Subscribed to cross-server chat channels.")
-            
-            async for message in self.pubsub.listen():
-                print(f"[{settings.SERVER_ID}] RAW REDIS EVENT: {message}") 
-                
-                if message["type"] == "pmessage":
+        """Deliver cross-server messages locally; survive Redis outages.
+
+        If the subscription or the connection fails, resubscribe with
+        exponential backoff instead of dying silently (which would stop
+        real-time delivery on this server until a restart). Messages missed
+        meanwhile are recovered by the client's history sync.
+        """
+        delay = RESUBSCRIBE_MIN_DELAY
+
+        while True:
+            pubsub = None
+            try:
+                pubsub = self._new_pubsub()
+                await pubsub.psubscribe(CHANNEL_PATTERN)
+                self.pubsub = pubsub
+                print(f"[{settings.SERVER_ID}] Subscribed to cross-server chat channels.")
+                delay = RESUBSCRIBE_MIN_DELAY
+
+                async for message in pubsub.listen():
+                    if message["type"] != "pmessage":
+                        continue
                     try:
-                        channel = message["channel"]
+                        target_user_id = int(message["channel"].split(":")[-1])
                         data = json.loads(message["data"])
-                        
-                        target_user_id = int(channel.split(":")[-1])
-                        await local_websocket_manager.send_personal_message(json.dumps(data), target_user_id)
-                    except Exception as inner_e:
-                        print(f"[{settings.SERVER_ID}] ERROR PARSING MESSAGE: {inner_e}")
-                        
-        except asyncio.CancelledError:
-            print(f"[{settings.SERVER_ID}] Redis listener shutting down.")
-        except Exception as fatal_e:
-            print(f"[{settings.SERVER_ID}] FATAL LISTENER CRASH: {fatal_e}")
+                        await local_websocket_manager.send_personal_message(
+                            json.dumps(data), target_user_id
+                        )
+                    except Exception as inner_error:
+                        print(f"[{settings.SERVER_ID}] Could not deliver Redis event: {inner_error}")
 
-# Ensure your global instance matches the name used in main.py and chat.py
+                print(f"[{settings.SERVER_ID}] Redis subscription ended.")
+            except asyncio.CancelledError:
+                print(f"[{settings.SERVER_ID}] Redis listener shutting down.")
+                raise
+            except Exception as error:
+                print(f"[{settings.SERVER_ID}] Redis listener error: {error}")
+            finally:
+                if pubsub is not None:
+                    try:
+                        await pubsub.aclose()
+                    except Exception:
+                        pass
+                if self.pubsub is pubsub:
+                    self.pubsub = None
+
+            print(f"[{settings.SERVER_ID}] Resubscribing to Redis in {delay:.0f}s.")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, RESUBSCRIBE_MAX_DELAY)
+
+
 redis_manager = RedisPubSubManager()
-
-
-
-"""
-Key Concepts in this Code:
-User-Specific Channels: We are using channels like chat:user:35. 
-This prevents every server from having to process every single message in the system. 
-Redis handles the routing efficiently.
-
-The Listener Loop: async for message in self.pubsub.listen() is an infinite asynchronous loop. 
-It runs quietly in the background without blocking the FastAPI HTTP endpoints.
-
-Decoupled Delivery: The subscribe_and_listen function accepts local_websocket_manager as an argument. 
-This connects the Redis network layer strictly to the local memory state.
-"""
