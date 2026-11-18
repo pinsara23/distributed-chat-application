@@ -16,6 +16,7 @@ interface State {
   activeId: number | null;
   conn: ConnState;
   presence: Map<number, Presence>;
+  usernames: Map<number, string>; // registered names, from the server
   blocked: Set<number>;
   myFingerprint: string | null;
   myKeyVersion: number;
@@ -28,7 +29,7 @@ interface State {
 }
 
 export const state: State = {
-  me: null, token: null, convs: new Map(), activeId: null, conn: "offline", presence: new Map(),
+  me: null, token: null, convs: new Map(), activeId: null, conn: "offline", presence: new Map(), usernames: new Map(),
   blocked: new Set(), myFingerprint: null, myKeyVersion: 1, keyCount: 0, loading: false, toasts: [], trust: null, authMessage: null,
   notifications: typeof Notification !== "undefined" && Notification.permission === "granted",
 };
@@ -68,7 +69,11 @@ function lsSet<K extends keyof Store>(name: K, value: Store[K]): void {
   try { localStorage.setItem(lsKey(name), JSON.stringify(value)); } catch { /* storage unavailable */ }
 }
 
-export const displayName = (peerId: number | null): string => (peerId ? lsGet("names")[peerId] || `User ${peerId}` : "Unknown contact");
+/** Your own nickname for the contact if you set one, else their registered username. */
+export const displayName = (peerId: number | null): string =>
+  (peerId ? lsGet("names")[peerId] || state.usernames.get(peerId) || `User ${peerId}` : "Unknown contact");
+export const nickname = (peerId: number | null): string => (peerId ? lsGet("names")[peerId] ?? "" : "");
+export const username = (peerId: number | null): string | null => (peerId ? state.usernames.get(peerId) ?? null : null);
 export function setContactName(peerId: number, name: string): void {
   const names = lsGet("names");
   if (name.trim()) names[peerId] = name.trim().slice(0, 40); else delete names[peerId];
@@ -376,11 +381,22 @@ async function loadHistory(conv: Conversation): Promise<void> {
   }
 }
 
+type ConvPayload = { id: number; created_at: string; participants?: { id: number; username: string }[] };
+
+/** Record members' usernames and set the chat's other member (the server now says who it is). */
+function applyParticipants(conv: Conversation, c: ConvPayload): void {
+  for (const p of c.participants ?? []) state.usernames.set(p.id, p.username);
+  const other = c.participants?.find((p) => p.id !== state.me?.id);
+  if (other) setPeer(conv, other.id);
+}
+
 export async function loadConversations(): Promise<void> {
-  const list = await api<{ id: number; created_at: string }[]>("/conversations/", { token: state.token });
+  const list = await api<ConvPayload[]>("/conversations/", { token: state.token });
   const fresh: Conversation[] = [];
   for (const c of list) {
-    if (!state.convs.has(c.id)) { const conv = makeConv(c.id, c.created_at); state.convs.set(c.id, conv); fresh.push(conv); }
+    let conv = state.convs.get(c.id);
+    if (!conv) { conv = makeConv(c.id, c.created_at); state.convs.set(c.id, conv); fresh.push(conv); }
+    applyParticipants(conv, c);
   }
   emit();
   await Promise.all(fresh.map((c) => loadHistory(c).catch((e: Error) => toast(`Could not load chat ${c.id}: ${e.message}`, "error"))));
@@ -392,9 +408,10 @@ const syncAll = (): Promise<unknown> => Promise.all([...state.convs.values()].ma
 export async function startChat(peerId: number): Promise<void> {
   if (!Number.isInteger(peerId) || peerId < 1) throw new Error("Enter a valid user ID.");
   if (peerId === state.me!.id) throw new Error("You can't chat with yourself.");
-  const c = await api<{ id: number; created_at: string }>("/conversations/", { method: "POST", token: state.token, json: { user_id: peerId } });
+  const c = await api<ConvPayload>("/conversations/", { method: "POST", token: state.token, json: { user_id: peerId } });
   let conv = state.convs.get(c.id);
   if (!conv) { conv = makeConv(c.id, c.created_at); state.convs.set(c.id, conv); }
+  applyParticipants(conv, c);
   setPeer(conv, peerId);
   emit();
   await loadHistory(conv).catch(() => undefined);
@@ -593,6 +610,7 @@ async function doStartSession(token: string, username: string): Promise<void> {
   state.me = { id, username };
   state.convs = new Map();
   state.presence = new Map();
+  state.usernames = new Map();
   state.blocked = new Set();
   state.activeId = null;
   state.authMessage = null;

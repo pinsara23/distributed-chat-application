@@ -39,6 +39,11 @@ async def test_conversation_lifecycle(async_client: AsyncClient):
     assert list_res.status_code == 200
     assert len(list_res.json()) == 1
     assert list_res.json()[0]["id"] == conv_id
+    # Both members come back with usernames (and no emails), so clients can show names.
+    members = list_res.json()[0]["participants"]
+    assert {m["username"] for m in members} == {"alice_chat", "bob_chat"}
+    assert all(set(m) == {"id", "username"} for m in members)
+    assert {m["id"] for m in conv_res.json()["participants"]} == {m["id"] for m in members}
 
     # 6. Alice fetches messages for this conversation (should be empty)
     msg_res = await async_client.get(f"/conversations/{conv_id}/messages", headers=headers)

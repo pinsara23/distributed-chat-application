@@ -10,6 +10,9 @@ from app.services.chat_service import ChatService
 
 router = APIRouter()
 
+def _with_participants(conversation, members: dict[int, list[dict]]) -> dict:
+    return {"id": conversation.id, "created_at": conversation.created_at, "participants": members.get(conversation.id, [])}
+
 def get_chat_service(db: AsyncSession = Depends(get_db)) -> ChatService:
     return ChatService(db)
 
@@ -19,14 +22,18 @@ async def create_conversation(
     current_user: User = Depends(get_current_user),
     chat_service: ChatService = Depends(get_chat_service)
 ):
-    return await chat_service.create_or_get_conversation(current_user_id=current_user.id, target_user_id=conv_in.user_id)
+    conversation = await chat_service.create_or_get_conversation(current_user_id=current_user.id, target_user_id=conv_in.user_id)
+    members = await chat_service.get_participants([conversation.id])
+    return _with_participants(conversation, members)
 
 @router.get("/", response_model=list[ConversationResponse])
 async def get_conversation(
     current_user: User = Depends(get_current_user),
     chat_service: ChatService = Depends(get_chat_service)
 ):
-    return await chat_service.get_user_conversation(current_user.id) 
+    conversations = await chat_service.get_user_conversation(current_user.id)
+    members = await chat_service.get_participants([c.id for c in conversations])
+    return [_with_participants(c, members) for c in conversations]
 
 @router.get("/{conversation_id}/messages")
 async def get_messages(

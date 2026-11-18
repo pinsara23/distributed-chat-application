@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { answerTrust, displayName, importKeyFile, securityInfo, reviewKey, setContactName, startChat } from "../engine";
+import { answerTrust, displayName, importKeyFile, nickname, securityInfo, reviewKey, setContactName, startChat, username } from "../engine";
 import { useEngine } from "../store";
 import { Avatar } from "./Avatar";
 import { Modal } from "./Modal";
@@ -42,7 +42,8 @@ export function InfoDialog({ open, onClose }: { open: boolean; onClose: () => vo
   const peerId = conv?.peerId ?? null;
   const name = displayName(peerId);
   const [draft, setDraft] = useState("");
-  useEffect(() => { if (open) setDraft(peerId && name !== `User ${peerId}` ? name : ""); }, [open, peerId, name]);
+  const registered = username(peerId);
+  useEffect(() => { if (open) setDraft(nickname(peerId)); }, [open, peerId]);
   if (!conv) return <Modal open={false} onClose={onClose}>{null}</Modal>;
   const info = securityInfo(peerId);
   return (
@@ -51,10 +52,10 @@ export function InfoDialog({ open, onClose }: { open: boolean; onClose: () => vo
         <h3>Contact info</h3>
         <div className="info-head">
           <Avatar big seed={peerId ?? conv.id} label={peerId ? name : "?"} />
-          <div><strong>{name}</strong><small>{peerId ? `User ID ${peerId}` : `Chat ${conv.id}`}</small></div>
+          <div><strong>{name}</strong><small>{peerId ? `${registered && registered !== name ? `@${registered} · ` : ""}User ID ${peerId}` : `Chat ${conv.id}`}</small></div>
         </div>
-        <label>Name (only visible to you)
-          <input value={draft} maxLength={40} placeholder="e.g. Alice" disabled={!peerId}
+        <label>Nickname (only visible to you)
+          <input value={draft} maxLength={40} placeholder={registered ?? "e.g. Alice"} disabled={!peerId}
             onChange={(e) => setDraft(e.target.value)} onBlur={() => peerId && setContactName(peerId, draft)}
             onKeyDown={(e) => { if (e.key === "Enter" && peerId) { setContactName(peerId, draft); e.currentTarget.blur(); } }} />
         </label>

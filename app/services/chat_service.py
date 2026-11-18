@@ -65,6 +65,21 @@ class ChatService:
         return new_conv  
 
 
+    async def get_participants(self, conversation_ids: list[int]) -> dict[int, list[dict]]:
+        """Members (id + username) of each conversation, in one query."""
+        if not conversation_ids:
+            return {}
+        result = await self.db.execute(
+            select(ConversationParticipant.conversation_id, User.id, User.username)
+            .join(User, User.id == ConversationParticipant.user_id)
+            .where(ConversationParticipant.conversation_id.in_(conversation_ids))
+            .order_by(User.id)
+        )
+        members: dict[int, list[dict]] = {cid: [] for cid in conversation_ids}
+        for conversation_id, user_id, username in result.all():
+            members[conversation_id].append({"id": user_id, "username": username})
+        return members
+
     async def get_user_conversation(self, user_id: int) -> list[Conversation]:
         query = (
             select(Conversation)
