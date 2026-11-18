@@ -146,6 +146,7 @@ class ChatService:
         ciphertext: bytes,
         nonce: bytes,
         key_version: int = 1,
+        recipient_key_version: int | None = None,
     ) -> Message:
         """Persist an E2EE message and its outbox event in one transaction.
 
@@ -170,6 +171,7 @@ class ChatService:
             ciphertext=ciphertext,
             nonce=nonce,
             key_version=key_version,
+            recipient_key_version=recipient_key_version,
         )
         self.db.add(new_message)
 

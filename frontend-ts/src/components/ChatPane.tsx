@@ -89,7 +89,7 @@ export function ChatPane({ onInfo }: { onInfo: () => void }) {
           </div>
         )}
 
-        <MessageList key={conv.id} conv={conv} query={finding ? query.trim() : ""} currentMatch={matches[cursor] ?? null} />
+        <MessageList key={`list-${conv.id}`} conv={conv} query={finding ? query.trim() : ""} currentMatch={matches[cursor] ?? null} />
 
         {!conv.peerId ? <AssignPeer convId={conv.id} /> : blocked ? (
           <div className="locked-bar">
@@ -97,7 +97,7 @@ export function ChatPane({ onInfo }: { onInfo: () => void }) {
             <span>{name}'s security code changed. Sending is paused.</span>
             <button type="button" className="primary" onClick={() => void reviewKey(conv.peerId!)}>Review</button>
           </div>
-        ) : <Composer key={conv.id} convId={conv.id} initial={conv.draft} />}
+        ) : <Composer key={`composer-${conv.id}`} convId={conv.id} initial={conv.draft} />}
       </div>
     </section>
   );

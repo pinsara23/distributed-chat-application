@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { setServer, tokenExpired } from "./api";
 import { AuthScreen } from "./components/AuthScreen";
 import { ChatPane } from "./components/ChatPane";
-import { InfoDialog, NewChatDialog, TrustDialog } from "./components/Dialogs";
+import { InfoDialog, KeysDialog, NewChatDialog, TrustDialog } from "./components/Dialogs";
 import { Sidebar } from "./components/Sidebar";
 import { Toasts } from "./components/Toasts";
 import { x25519Supported } from "./crypto";
@@ -36,6 +36,7 @@ export function App() {
   const [newOpen, setNewOpen] = useState(false);
   const [prefill, setPrefill] = useState<number | undefined>();
   const [infoOpen, setInfoOpen] = useState(false);
+  const [keysOpen, setKeysOpen] = useState(false);
 
   // Keyboard: Ctrl/Cmd+K focuses chat search; Esc closes the open chat.
   useEffect(() => {
@@ -76,10 +77,11 @@ export function App() {
     <>
       {s.me ? (
         <div className={`app${s.activeId != null ? " show-chat" : ""}`}>
-          <Sidebar ref={search} onNewChat={(id) => { setPrefill(id); setNewOpen(true); }} />
+          <Sidebar ref={search} onNewChat={(id) => { setPrefill(id); setNewOpen(true); }} onKeys={() => setKeysOpen(true)} />
           <ChatPane onInfo={() => setInfoOpen(true)} />
           <NewChatDialog open={newOpen} prefill={prefill} onClose={() => setNewOpen(false)} />
           <InfoDialog open={infoOpen} onClose={() => setInfoOpen(false)} />
+          <KeysDialog open={keysOpen} onClose={() => setKeysOpen(false)} />
           <TrustDialog />
         </div>
       ) : <AuthScreen />}

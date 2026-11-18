@@ -25,7 +25,10 @@ class Message(Base):
    # End-to-end encrypted payload: the server never sees plaintext.
    ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
    nonce: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+   # Sender's key version, and the recipient's key version used for ECDH
+   # (NULL for messages sent before it was recorded).
    key_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+   recipient_key_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 

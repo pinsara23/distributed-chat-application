@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
-from app.schemas.key import PublicKeyCreate, PublicKeyResponse
+from app.schemas.key import PublicKeyCreate, PublicKeyResponse, PublicKeyVersionResponse
 from app.services.key_service import KeyService
 
 router = APIRouter()
@@ -19,6 +19,15 @@ async def upload_public_key(
 ):
     """Uploads or updates the user's public key."""
     return await key_service.upload_or_update_key(current_user.id, key_in.public_key_pem)
+
+@router.get("/{user_id}/history", response_model=list[PublicKeyVersionResponse])
+async def get_public_key_history(
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    key_service: KeyService = Depends(get_key_service)
+):
+    """Every public key the user has published, so old messages stay decryptable."""
+    return await key_service.get_key_history(user_id)
 
 @router.get("/{user_id}", response_model=PublicKeyResponse)
 async def get_public_key(

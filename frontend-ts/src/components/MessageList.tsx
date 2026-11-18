@@ -14,7 +14,7 @@ function Bubble({ conv, m, query, current }: { conv: Conversation; m: Msg; query
       {m.text != null ? (
         <span className="text">{renderText(m.text, query, current)}</span>
       ) : m.status === "bad" ? (
-        <span className="text sys"><MiniIcon name="warn" />This message couldn't be decrypted.</span>
+        <span className="text sys"><MiniIcon name="warn" />This message couldn't be decrypted. If it was sent from another browser or the Python client, import that key (key icon at the top left).</span>
       ) : (
         <span className="text sys"><MiniIcon name="lock" />{conv.peerId ? "Waiting for encryption key…" : "Set the contact to read this message."}</span>
       )}
@@ -52,7 +52,9 @@ export function MessageList({ conv, query, currentMatch }: Props) {
     const added = conv.msgs.length - lastLen.current;
     lastLen.current = conv.msgs.length;
     const last = conv.msgs[conv.msgs.length - 1];
-    if (stick.current || (last && last.senderId === state.me!.id)) toBottom(true);
+    // Follow the bottom only if already there, or when I just sent something. (Before, any
+    // re-render — presence, toasts — yanked the view down whenever the last message was mine.)
+    if (stick.current || (added > 0 && last && last.senderId === state.me!.id)) toBottom();
     else if (added > 0) setAway((n) => n + added);
   });
 

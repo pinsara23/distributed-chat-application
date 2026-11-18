@@ -2,7 +2,7 @@
 // Framework-free. React reads `state` through useEngine() (see store.ts).
 
 import { api, ApiError, canFailover, openSocket, rotateServer, tokenExpired, tokenUserId } from "./api";
-import { buildAad, decryptMessage, deriveSharedKey, encryptMessage, fingerprint, loadIdentity } from "./crypto";
+import { buildAad, decryptMessage, deriveSharedKey, encryptMessage, fingerprint, identities, importIdentity, loadIdentity, type IdentityRecord } from "./crypto";
 import type { ConnState, Conversation, Msg, Presence, RawMessage, Toast, TrustPrompt, WireMessage } from "./types";
 
 export const MAX_TEXT_BYTES = 30000; // server cap is 32 KiB of ciphertext
@@ -18,6 +18,8 @@ interface State {
   presence: Map<number, Presence>;
   blocked: Set<number>;
   myFingerprint: string | null;
+  myKeyVersion: number;
+  keyCount: number;
   loading: boolean;
   toasts: Toast[];
   trust: TrustPrompt | null;
@@ -27,7 +29,7 @@ interface State {
 
 export const state: State = {
   me: null, token: null, convs: new Map(), activeId: null, conn: "offline", presence: new Map(),
-  blocked: new Set(), myFingerprint: null, loading: false, toasts: [], trust: null, authMessage: null,
+  blocked: new Set(), myFingerprint: null, myKeyVersion: 1, keyCount: 0, loading: false, toasts: [], trust: null, authMessage: null,
   notifications: typeof Notification !== "undefined" && Notification.permission === "granted",
 };
 
@@ -53,7 +55,11 @@ export function toast(text: string, kind: Toast["kind"] = "info"): void {
 }
 
 // ---- per-user local storage (names, peers, TOFU fingerprints, read marks) ----------
-type Store = { names: Record<string, string>; peers: Record<string, number>; read: Record<string, number>; tofu: Record<string, { fingerprint: string; version: number }> };
+type Store = {
+  names: Record<string, string>; peers: Record<string, number>; read: Record<string, number>;
+  tofu: Record<string, { fingerprint: string; version: number }>;
+  pins: Record<string, Record<string, string>>; // userId -> key_version -> fingerprint, for old keys
+};
 const lsKey = (name: keyof Store): string => `dchat:${state.me!.id}:${name}`;
 function lsGet<K extends keyof Store>(name: K): Store[K] {
   try { return (JSON.parse(localStorage.getItem(lsKey(name)) ?? "null") ?? {}) as Store[K]; } catch { return {} as Store[K]; }
@@ -117,7 +123,7 @@ function setPeer(conv: Conversation, peerId: number): void {
 }
 
 // ---- key management (TOFU) -------------------------------------------------------
-const keyCache = new Map<number, { key: CryptoKey; fetchedAt: number }>();
+const keyCache = new Map<number, { key: CryptoKey; version: number; fetchedAt: number }>();
 const keyInflight = new Map<number, Promise<CryptoKey | null>>();
 let trustResolvers: Array<(accept: boolean) => void> = [];
 
@@ -154,7 +160,7 @@ async function fetchPeerKey(peerId: number): Promise<CryptoKey | null> {
   lsSet("tofu", tofu);
   state.blocked.delete(peerId);
   const key = await deriveSharedKey(data.public_key_pem);
-  keyCache.set(peerId, { key, fetchedAt: Date.now() });
+  keyCache.set(peerId, { key, version: data.key_version, fetchedAt: Date.now() });
   emit();
   return key;
 }
@@ -192,29 +198,114 @@ export function securityInfo(peerId: number | null): { mine: string | null; thei
   return { mine: state.myFingerprint, theirs: peerId ? lsGet("tofu")[peerId]?.fingerprint ?? null : null };
 }
 
+// ---- old keys (key history) ---------------------------------------------------------
+// Messages are encrypted with whatever keys were current when they were sent. After a
+// key change (new browser, imported key, Python client) they need the old public keys.
+type KeyHistory = { pems: Map<number, string>; fetchedAt: number };
+const historyCache = new Map<number, KeyHistory>();
+const historyInflight = new Map<number, Promise<KeyHistory>>();
+const pairCache = new Map<string, Promise<CryptoKey>>();
+
+function getKeyHistory(userId: number, force = false): Promise<KeyHistory> {
+  const cached = historyCache.get(userId);
+  if (cached && !force) return Promise.resolve(cached);
+  let p = historyInflight.get(userId);
+  if (!p) {
+    p = fetchKeyHistory(userId).finally(() => historyInflight.delete(userId));
+    historyInflight.set(userId, p);
+  }
+  return p;
+}
+
+async function fetchKeyHistory(userId: number): Promise<KeyHistory> {
+  let rows: { key_version: number; public_key_pem: string }[] = [];
+  try {
+    rows = await api(`/keys/${userId}/history`, { token: state.token });
+  } catch (err) {
+    if (!(err instanceof ApiError && err.status === 404)) throw err; // older server: no history
+  }
+  const pins = lsGet("pins");
+  const pinned = pins[userId] ?? {};
+  const pems = new Map<number, string>();
+  for (const r of rows) {
+    const fp = await fingerprint(r.public_key_pem);
+    // A past key must never change. If the server now reports a different one, ignore it.
+    if (pinned[r.key_version] && pinned[r.key_version] !== fp) continue;
+    pinned[r.key_version] = fp;
+    pems.set(r.key_version, r.public_key_pem);
+  }
+  pins[userId] = pinned;
+  lsSet("pins", pins);
+  const hist = { pems, fetchedAt: Date.now() };
+  historyCache.set(userId, hist);
+  return hist;
+}
+
+function pairKey(mine: IdentityRecord, peerPem: string): Promise<CryptoKey> {
+  const id = `${mine.publicPem}|${peerPem}`;
+  let p = pairCache.get(id);
+  if (!p) { p = deriveSharedKey(peerPem, mine); pairCache.set(id, p); p.catch(() => pairCache.delete(id)); }
+  return p;
+}
+
+/** Every (my private key, their public key) pair worth trying, the tagged versions first. */
+async function candidatePairs(peerId: number, myVer: number | null | undefined, peerVer: number | null | undefined, force: boolean): Promise<Array<[IdentityRecord, string]>> {
+  const [peerHist, myHist] = await Promise.all([getKeyHistory(peerId, force), getKeyHistory(state.me!.id, force)]);
+  const peerPems = [...peerHist.pems.values()].reverse(); // newest first
+  const preferredPeer = peerVer != null ? peerHist.pems.get(peerVer) : undefined;
+  if (preferredPeer) peerPems.unshift(preferredPeer);
+  const mineList = identities();
+  const myPem = myVer != null ? myHist.pems.get(myVer) : undefined;
+  const preferredMine = mineList.find((r) => r.publicPem === myPem);
+  if (preferredMine) mineList.unshift(preferredMine);
+  const seen = new Set<string>();
+  const out: Array<[IdentityRecord, string]> = [];
+  for (const m of mineList) for (const pem of peerPems) {
+    const id = `${m.publicPem}|${pem}`;
+    if (!seen.has(id)) { seen.add(id); out.push([m, pem]); }
+  }
+  return out;
+}
+
 // ---- decrypt / ingest ------------------------------------------------------------
 async function decryptInto(conv: Conversation, msg: Msg): Promise<void> {
   const raw = msg.raw;
   if (!conv.peerId || !raw) { msg.status = "locked"; return; }
+  const peerId = conv.peerId;
   const mine = msg.senderId === state.me!.id;
   const aad = buildAad(raw.message_uuid, conv.id, raw.sender_id);
-  const attempt = async (force: boolean): Promise<void> => {
-    const key = await getPeerKey(conv.peerId!, force);
-    if (!key) { msg.status = "locked"; return; }
-    msg.text = await decryptMessage(raw.ciphertext, raw.nonce, key, aad);
-    msg.status = mine ? "sent" : "received";
-  };
-  try {
-    await attempt(false);
-  } catch (err) {
-    if (err instanceof NoKeyError) { msg.status = "locked"; return; }
-    // Maybe the peer rotated their key since we cached it: refetch once and retry.
-    const cached = keyCache.get(conv.peerId);
+  const tryKey = async (key: CryptoKey): Promise<boolean> => {
     try {
-      if (cached && Date.now() - cached.fetchedAt > 5000) { await attempt(true); return; }
-    } catch { /* fall through */ }
-    msg.status = "bad";
+      msg.text = await decryptMessage(raw.ciphertext, raw.nonce, key, aad);
+      msg.status = mine ? "sent" : "received";
+      return true;
+    } catch { return false; } // wrong key: AES-GCM authentication fails
+  };
+
+  // Current keys first (also runs the security-code check for this contact).
+  let current: CryptoKey | null = null;
+  try { current = await getPeerKey(peerId); } catch { /* no current key: older keys may still work */ }
+  if (!current && state.blocked.has(peerId)) { msg.status = "locked"; return; }
+  if (current && await tryKey(current)) return;
+
+  // Then older keys, by the versions the message was tagged with. Refetch once if stale.
+  const myVer = mine ? raw.key_version : raw.recipient_key_version;
+  const peerVer = mine ? raw.recipient_key_version : raw.key_version;
+  let tried = 0;
+  for (const force of [false, true]) {
+    if (force) {
+      if (Date.now() - (historyCache.get(peerId)?.fetchedAt ?? 0) < 5000) break;
+      // The contact may have changed keys since we cached them (shows the security prompt).
+      try { const k = await getPeerKey(peerId, true); if (k && await tryKey(k)) return; } catch { /* no key */ }
+    }
+    let pairs: Array<[IdentityRecord, string]>;
+    try { pairs = await candidatePairs(peerId, myVer, peerVer, force); } catch { break; }
+    for (const [me, pem] of pairs) {
+      tried++;
+      try { if (await tryKey(await pairKey(me, pem))) return; } catch { /* unusable key */ }
+    }
   }
+  msg.status = current || tried ? "bad" : "locked";
 }
 
 async function retryLocked(conv: Conversation | undefined): Promise<void> {
@@ -245,6 +336,7 @@ async function ingest(raw: RawMessage): Promise<void> {
   msg.raw = raw;
   conv.lastId = Math.max(conv.lastId, raw.id);
   pending.delete(msg.uuid);
+  reencrypts.delete(msg.uuid);
   if (ownPending) msg.status = "sent"; else await decryptInto(conv, msg);
   conv.msgs.sort(sortMsgs);
   const visible = document.visibilityState === "visible" && conv.id === state.activeId;
@@ -355,7 +447,8 @@ export async function sendText(convId: number, text: string): Promise<boolean> {
 
   const uuid = crypto.randomUUID();
   const { ciphertext, nonce } = await encryptMessage(text, key, buildAad(uuid, conv.id, state.me!.id));
-  const payload: WireMessage = { message_id: uuid, conversation_id: conv.id, target_user_id: conv.peerId, ciphertext, nonce, key_version: 1 };
+  const payload: WireMessage = { message_id: uuid, conversation_id: conv.id, target_user_id: conv.peerId, ciphertext, nonce,
+    key_version: state.myKeyVersion, recipient_key_version: keyCache.get(conv.peerId)?.version };
   const msg: Msg = { uuid, id: null, convId: conv.id, senderId: state.me!.id, text, status: "sending", ts: new Date() };
   conv.byUuid.set(uuid, msg);
   conv.msgs.push(msg);
@@ -374,6 +467,26 @@ export function discardFailed(convId: number, uuid: string, resend: boolean): vo
   conv.msgs = conv.msgs.filter((m) => m !== msg);
   emit();
   if (resend && msg.text) void sendText(convId, msg.text);
+}
+
+/** The server says the contact's key changed since we encrypted: fetch it and re-encrypt (same id). */
+const reencrypts = new Map<string, number>();
+async function reencrypt(uuid: string): Promise<void> {
+  const p = pending.get(uuid);
+  const conv = p ? state.convs.get(p.conversation_id) : undefined;
+  const msg = conv?.byUuid.get(uuid);
+  if (!p || !conv || !msg || msg.text == null) return;
+  const attempts = (reencrypts.get(uuid) ?? 0) + 1;
+  reencrypts.set(uuid, attempts);
+  if (attempts > 3) { reencrypts.delete(uuid); failMessage(uuid, "Your contact's key keeps changing. Try again."); return; }
+  let key: CryptoKey | null;
+  try { key = await getPeerKey(p.target_user_id, true); } catch { failMessage(uuid, "Your contact has no encryption key."); return; }
+  if (!key) { failMessage(uuid, "Not sent: review the changed security code first."); return; }
+  const { ciphertext, nonce } = await encryptMessage(msg.text, key, buildAad(uuid, conv.id, state.me!.id));
+  const next: WireMessage = { ...p, ciphertext, nonce, key_version: state.myKeyVersion, recipient_key_version: keyCache.get(p.target_user_id)?.version };
+  if (!pending.has(uuid)) return; // delivered or discarded meanwhile
+  pending.set(uuid, next);
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(next));
 }
 
 function failMessage(uuid: string, reason: string): void {
@@ -399,6 +512,12 @@ export function connect(): void {
   clearTimeout(retryTimer);
   if (tokenExpired(state.token)) return logout("Your session expired. Please sign in again.");
   setConn("connecting");
+  if (ws) { // never keep two sockets: each would deliver (and sync) everything again
+    const old = ws;
+    ws = null;
+    old.onclose = null; old.onmessage = null; old.onopen = null;
+    try { old.close(1000); } catch { /* already closed */ }
+  }
   let socket: WebSocket;
   try { socket = openSocket(state.token); } catch { scheduleReconnect(); return; }
   ws = socket;
@@ -419,6 +538,7 @@ export function connect(): void {
     if (data.type === "pong") return;
     if (data.error) {
       const id = data.message_id as string | undefined;
+      if (data.code === "stale_recipient_key" && id) { void reencrypt(id); return; } // handled silently
       if (id && data.retryable === false) failMessage(id, String(data.error));
       else if (id) setTimeout(() => { const p = pending.get(id); if (p && ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(p)); }, 3000);
       toast(String(data.error), "error");
@@ -455,7 +575,17 @@ export async function register(username: string, email: string, password: string
   await api("/auth/register", { method: "POST", json: { username, email, password } });
 }
 
-export async function startSession(token: string, username: string): Promise<void> {
+// React StrictMode (dev) runs the boot effect twice: share one in-flight start per token
+// instead of racing two sessions (two sockets, two history loads).
+let starting: { token: string; p: Promise<void> } | null = null;
+export function startSession(token: string, username: string): Promise<void> {
+  if (starting?.token === token) return starting.p;
+  const p = doStartSession(token, username).finally(() => { if (starting?.p === p) starting = null; });
+  starting = { token, p };
+  return p;
+}
+
+async function doStartSession(token: string, username: string): Promise<void> {
   const id = tokenUserId(token);
   if (!id) throw new Error("Invalid session token.");
   stopped = false;
@@ -467,6 +597,8 @@ export async function startSession(token: string, username: string): Promise<voi
   state.activeId = null;
   state.authMessage = null;
   keyCache.clear();
+  historyCache.clear();
+  pairCache.clear();
   pending.clear();
   retryDelay = 1000;
 
@@ -474,7 +606,9 @@ export async function startSession(token: string, username: string): Promise<voi
     const identity = await loadIdentity(id);
     state.myFingerprint = identity.fingerprint;
     // Publishing the same key again is a no-op server side; a new key bumps key_version.
-    await api("/keys/", { method: "POST", token, json: { public_key_pem: identity.publicPem } });
+    const published = await api<{ key_version: number }>("/keys/", { method: "POST", token, json: { public_key_pem: identity.publicPem } });
+    state.myKeyVersion = published.key_version;
+    state.keyCount = identities().length;
     state.loading = true;
     emit();
     await loadConversations();
@@ -487,6 +621,35 @@ export async function startSession(token: string, username: string): Promise<voi
   connect();
   clearInterval(presenceTimer);
   presenceTimer = window.setInterval(() => void refreshPresence(), 15000);
+}
+
+/**
+ * Import a private key file (e.g. the Python client's user<N>_identity.key) so messages
+ * encrypted with it become readable. With `makeActive`, it is also used for new messages,
+ * so this browser and the Python client share one key.
+ */
+export async function importKeyFile(pemText: string, makeActive: boolean): Promise<string> {
+  const me = state.me;
+  if (!me) throw new Error("Not signed in.");
+  const r = await importIdentity(me.id, pemText, makeActive);
+  keyCache.clear();
+  pairCache.clear();
+  historyCache.delete(me.id);
+  if (makeActive) {
+    const published = await api<{ key_version: number }>("/keys/", { method: "POST", token: state.token, json: { public_key_pem: r.publicPem } });
+    state.myKeyVersion = published.key_version;
+    state.myFingerprint = r.fingerprint;
+  }
+  state.keyCount = identities().length;
+  emit();
+  let before = 0, after = 0;
+  for (const conv of state.convs.values()) {
+    before += conv.msgs.filter((m) => m.text == null && m.raw).length;
+    await retryLocked(conv);
+    after += conv.msgs.filter((m) => m.text == null && m.raw).length;
+  }
+  const opened = before - after;
+  return `${r.isNew ? "Key imported" : "Key was already in this browser"}${makeActive ? " and set as your active key" : ""}. ${opened} message${opened === 1 ? "" : "s"} unlocked.`;
 }
 
 export function logout(message?: string): void {

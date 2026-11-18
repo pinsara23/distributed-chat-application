@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { answerTrust, displayName, securityInfo, reviewKey, setContactName, startChat } from "../engine";
+import { answerTrust, displayName, importKeyFile, securityInfo, reviewKey, setContactName, startChat } from "../engine";
 import { useEngine } from "../store";
 import { Avatar } from "./Avatar";
 import { Modal } from "./Modal";
@@ -88,6 +88,52 @@ export function TrustDialog() {
           </div>
         </div>
       )}
+    </Modal>
+  );
+}
+
+/** Import a private key file (e.g. the Python client's user<N>_identity.key) to read older messages. */
+export function KeysDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const s = useEngine();
+  const [file, setFile] = useState<File | null>(null);
+  const [active, setActive] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState("");
+  const [error, setError] = useState("");
+  useEffect(() => { if (open) { setFile(null); setResult(""); setError(""); setActive(true); } }, [open]);
+
+  const submit = async (e: FormEvent): Promise<void> => {
+    e.preventDefault();
+    if (!file) return;
+    setBusy(true); setError(""); setResult("");
+    try {
+      if (file.size > 16 * 1024) throw new Error("That file is too large to be a key file.");
+      setResult(await importKeyFile(await file.text(), active));
+    } catch (err) { setError((err as Error).message); }
+    finally { setBusy(false); }
+  };
+  return (
+    <Modal open={open} onClose={onClose}>
+      <form className="info" onSubmit={(e) => void submit(e)}>
+        <h3>Message keys</h3>
+        <p className="muted">Messages can only be read with the key they were encrypted with. If you used another browser or the Python client before, import that key file (for example <code>user{s.me?.id}_identity.key</code>) to read those messages here.</p>
+        <div className="fp"><small>Your security code (key version {s.myKeyVersion})</small><code>{s.myFingerprint}</code></div>
+        <p className="muted">Keys stored in this browser: <strong>{s.keyCount}</strong></p>
+        <label>Key file
+          <input type="file" accept=".key,.pem,text/plain" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+        </label>
+        <label className="check">
+          <input type="checkbox" checked={active} onChange={(e) => setActive(e.target.checked)} />
+          Also use this key for new messages (same key as the Python client). Your contacts will see your security code change once.
+        </label>
+        <p className="muted">The key never leaves this browser. It is stored so it can't be read back out.</p>
+        {error && <p className="error" role="alert">{error}</p>}
+        {result && <p role="status">{result}</p>}
+        <div className="dlg-actions">
+          <button type="button" className="ghost" onClick={onClose}>Close</button>
+          <button type="submit" className="primary" disabled={busy || !file}>{busy ? "Importing…" : "Import key"}</button>
+        </div>
+      </form>
     </Modal>
   );
 }

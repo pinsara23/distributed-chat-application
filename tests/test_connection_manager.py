@@ -156,3 +156,38 @@ def test_ws_errors_identify_the_message_and_say_if_retryable(monkeypatch, failur
     assert reply["message_id"] == message_id
     assert reply["retryable"] is retryable
     assert "error" in reply
+
+
+@pytest.mark.parametrize("sent_version,current_version,rejected", [(1, 2, True), (2, 2, False), (None, 2, False)])
+def test_ws_rejects_messages_encrypted_to_an_old_recipient_key(monkeypatch, sent_version, current_version, rejected):
+    from types import SimpleNamespace
+
+    async def noop(*a, **k):
+        pass
+
+    saved = []
+
+    async def fake_save(self, **kwargs):
+        saved.append(kwargs)
+        raise RuntimeError("stop after save")  # only checking whether save was reached
+
+    async def fake_key(self, user_id):
+        return SimpleNamespace(key_version=current_version)
+
+    for name in ("mark_online", "mark_offline", "refresh_presence"):
+        monkeypatch.setattr(chat.presence_service, name, noop)
+    monkeypatch.setattr(chat.ChatService, "save_message", fake_save)
+    monkeypatch.setattr(chat.KeyService, "get_key_by_user_id", fake_key)
+
+    message_id = str(uuid.uuid4())
+    frame = json.loads(_valid_frame(message_id))
+    if sent_version is not None:
+        frame["recipient_key_version"] = sent_version
+    with TestClient(app).websocket_connect(f"/ws/chat?token={_ws_token()}") as ws:
+        ws.send_text(json.dumps(frame))
+        if rejected:
+            reply = json.loads(ws.receive_text())
+            assert reply["code"] == "stale_recipient_key"
+            assert reply["message_id"] == message_id
+            assert reply["current_key_version"] == current_version
+    assert bool(saved) is not rejected

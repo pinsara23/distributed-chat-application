@@ -6,6 +6,7 @@ export interface RawMessage {
   ciphertext: string;
   nonce: string;
   key_version: number;
+  recipient_key_version?: number | null;
   created_at: string | null;
 }
 
@@ -46,6 +47,7 @@ export interface WireMessage {
   ciphertext: string;
   nonce: string;
   key_version: number;
+  recipient_key_version?: number;
 }
 
 export interface ServerChoice { value: string; label: string; ports: string[] }

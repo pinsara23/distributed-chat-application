@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from app.models.public_key import PublicKey
+from app.models.public_key import PublicKey, PublicKeyHistory
 
 class KeyService:
     def __init__(self, db: AsyncSession):
@@ -27,6 +27,9 @@ class KeyService:
             db_key = PublicKey(user_id=user_id, public_key_pem=public_key_pem, key_version=1)
             self.db.add(db_key)
 
+        # Keep every version so peers can still decrypt messages sent before a key change.
+        self.db.add(PublicKeyHistory(user_id=user_id, key_version=db_key.key_version, public_key_pem=public_key_pem))
+
         await self.db.commit()
         await self.db.refresh(db_key)
         return db_key
@@ -36,3 +39,13 @@ class KeyService:
         stmt = select(PublicKey).where(PublicKey.user_id == user_id)
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def get_key_history(self, user_id: int) -> list[PublicKeyHistory]:
+        """All public keys the user has published, oldest first."""
+        stmt = (
+            select(PublicKeyHistory)
+            .where(PublicKeyHistory.user_id == user_id)
+            .order_by(PublicKeyHistory.key_version.asc())
+        )
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())

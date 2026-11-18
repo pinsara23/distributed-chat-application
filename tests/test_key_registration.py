@@ -76,3 +76,51 @@ async def test_changed_key_bumps_version():
     result = await KeyService(session).upload_or_update_key(1, new)
     assert result.key_version == 4
     assert result.public_key_pem == new
+
+
+class _RecordingSession(_Session):
+    def __init__(self, row):
+        super().__init__(row)
+        self.added = []
+
+    def add(self, obj):
+        self.added.append(obj)
+
+
+async def test_new_and_changed_keys_are_kept_in_history():
+    from app.models.public_key import PublicKeyHistory
+
+    old, new = (_pem(x25519.X25519PrivateKey.generate()) for _ in range(2))
+    session = _RecordingSession(_Key(old, version=2))
+    await KeyService(session).upload_or_update_key(1, new)
+    history = [o for o in session.added if isinstance(o, PublicKeyHistory)]
+    assert [(h.key_version, h.public_key_pem) for h in history] == [(3, new)]
+
+    first = _RecordingSession(None)
+    await KeyService(first).upload_or_update_key(1, old)
+    history = [o for o in first.added if isinstance(o, PublicKeyHistory)]
+    assert [(h.key_version, h.public_key_pem) for h in history] == [(1, old)]
+
+
+async def test_reupload_does_not_add_history():
+    pem = _pem(x25519.X25519PrivateKey.generate())
+    session = _RecordingSession(_Key(pem, version=2))
+    await KeyService(session).upload_or_update_key(1, pem)
+    assert session.added == []
+
+
+def test_message_carries_recipient_key_version():
+    import base64, uuid
+    from types import SimpleNamespace
+    from app.schemas.message import WsMessageIn, serialize_message
+
+    msg = WsMessageIn(message_id=uuid.uuid4(), conversation_id=1, target_user_id=2,
+                      ciphertext=base64.b64encode(b"x" * 20).decode(), nonce=base64.b64encode(b"n" * 12).decode(),
+                      key_version=3, recipient_key_version=5)
+    assert msg.recipient_key_version == 5
+    legacy = WsMessageIn(message_id=uuid.uuid4(), conversation_id=1, target_user_id=2,
+                         ciphertext=msg.ciphertext, nonce=msg.nonce)
+    assert legacy.recipient_key_version is None
+    row = SimpleNamespace(id=1, message_uuid=uuid.uuid4(), conversation_id=1, sender_id=1, ciphertext=b"c",
+                          nonce=b"n", key_version=3, recipient_key_version=5, created_at=None)
+    assert serialize_message(row)["recipient_key_version"] == 5

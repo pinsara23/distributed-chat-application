@@ -5,9 +5,9 @@ import { useEngine } from "../store";
 import { Avatar } from "./Avatar";
 import { Icon, MiniIcon } from "./Icons";
 
-interface Props { onNewChat: (prefillId?: number) => void }
+interface Props { onNewChat: (prefillId?: number) => void; onKeys: () => void }
 
-export const Sidebar = forwardRef<HTMLInputElement, Props>(function Sidebar({ onNewChat }, searchRef) {
+export const Sidebar = forwardRef<HTMLInputElement, Props>(function Sidebar({ onNewChat, onKeys }, searchRef) {
   const s = useEngine();
   const [q, setQ] = useState("");
   const needle = q.trim().toLowerCase();
@@ -25,6 +25,7 @@ export const Sidebar = forwardRef<HTMLInputElement, Props>(function Sidebar({ on
         <div className="bar-actions">
           <button className={`icon${s.notifications ? " active-btn" : ""}`} type="button" onClick={() => void toggleNotifications()} aria-pressed={s.notifications}
             title={s.notifications ? "Notifications on" : "Turn on notifications"} aria-label="Toggle notifications"><Icon name={s.notifications ? "bell" : "bellOff"} /></button>
+          <button className="icon" type="button" onClick={onKeys} title="Message keys" aria-label="Message keys"><Icon name="key" /></button>
           <button className="icon" type="button" onClick={() => onNewChat()} title="New chat" aria-label="New chat"><Icon name="newChat" /></button>
           <button className="icon" type="button" onClick={() => logout()} title="Sign out" aria-label="Sign out"><Icon name="logout" /></button>
         </div>

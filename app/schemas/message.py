@@ -34,7 +34,8 @@ class WsMessageIn(BaseModel):
     target_user_id: int
     ciphertext: str = Field(max_length=MAX_CIPHERTEXT_BYTES * 2)
     nonce: str = Field(max_length=64)
-    key_version: int = Field(default=1, ge=1)
+    key_version: int = Field(default=1, ge=1)            # sender's key version
+    recipient_key_version: int | None = Field(default=None, ge=1)
 
     @field_validator("ciphertext")
     @classmethod
@@ -71,5 +72,6 @@ def serialize_message(message) -> dict:
         "ciphertext": base64.b64encode(bytes(message.ciphertext)).decode("ascii"),
         "nonce": base64.b64encode(bytes(message.nonce)).decode("ascii"),
         "key_version": message.key_version,
+        "recipient_key_version": getattr(message, "recipient_key_version", None),
         "created_at": created_at.isoformat() if created_at else None,
     }

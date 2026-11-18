@@ -33,3 +33,12 @@ class PublicKeyResponse(BaseModel):
     public_key_pem: str
     key_version: int
     created_at: datetime
+
+
+class PublicKeyVersionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    user_id: int
+    key_version: int
+    public_key_pem: str
+    created_at: datetime

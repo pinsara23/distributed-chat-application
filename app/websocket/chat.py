@@ -10,6 +10,7 @@ from app.core.database import get_db
 from app.core.config import settings
 from app.schemas.auth import TokenPayload
 from app.services.chat_service import ChatService
+from app.services.key_service import KeyService
 from app.schemas.message import WsMessageIn, serialize_message
 from app.messaging.redis_client import redis_manager
 
@@ -139,6 +140,24 @@ async def websocket_endpoint(
                 await websocket.send_text(json.dumps({"error": f"Invalid message: {field}: {first['msg']}"}))
                 continue
 
+            # Encrypted to an outdated recipient key: the recipient could never read it.
+            # Tell the sender to fetch the new key and re-encrypt (same message_id).
+            if incoming.recipient_key_version is not None:
+                try:
+                    current_key = await KeyService(db).get_key_by_user_id(incoming.target_user_id)
+                except SQLAlchemyError:
+                    current_key = None
+                    await db.rollback()
+                if current_key is not None and current_key.key_version != incoming.recipient_key_version:
+                    await websocket.send_text(json.dumps({
+                        "error": "The recipient's encryption key changed.",
+                        "code": "stale_recipient_key",
+                        "message_id": str(incoming.message_id),
+                        "current_key_version": current_key.key_version,
+                        "retryable": True,
+                    }))
+                    continue
+
             try:
                 saved_msg = await chat_service.save_message(
                     conversation_id=incoming.conversation_id,
@@ -148,6 +167,7 @@ async def websocket_endpoint(
                     ciphertext=incoming.ciphertext_bytes,
                     nonce=incoming.nonce_bytes,
                     key_version=incoming.key_version,
+                    recipient_key_version=incoming.recipient_key_version,
                 )
             except HTTPException as exc:
                 await websocket.send_text(json.dumps({

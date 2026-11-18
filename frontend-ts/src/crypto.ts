@@ -57,8 +57,11 @@ export async function fingerprint(pem: string): Promise<string> {
   return [...digest].map((b) => b.toString(16).padStart(2, "0").toUpperCase()).join(":");
 }
 
-// ---- identity storage: IndexedDB, private key is NON-extractable ----
-interface IdentityRecord { privateKey: CryptoKey; publicPem: string }
+// ---- identity storage: IndexedDB, private keys are NON-extractable ----
+// A keyring keeps every private key this browser has used (generated or imported),
+// so messages encrypted under an older key stay readable after a key change.
+export interface IdentityRecord { privateKey: CryptoKey; publicPem: string }
+interface KeyringRecord { active: IdentityRecord; all: IdentityRecord[] }
 
 function idb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -69,16 +72,16 @@ function idb(): Promise<IDBDatabase> {
   });
 }
 
-async function idbGet(key: string): Promise<IdentityRecord | undefined> {
+async function idbGet<T>(key: string): Promise<T | undefined> {
   const db = await idb();
   return new Promise((resolve, reject) => {
     const r = db.transaction("identity").objectStore("identity").get(key);
-    r.onsuccess = () => resolve(r.result as IdentityRecord | undefined);
+    r.onsuccess = () => resolve(r.result as T | undefined);
     r.onerror = () => reject(r.error);
   });
 }
 
-async function idbPut(key: string, value: IdentityRecord): Promise<void> {
+async function idbPut(key: string, value: unknown): Promise<void> {
   const db = await idb();
   return new Promise((resolve, reject) => {
     const tx = db.transaction("identity", "readwrite");
@@ -88,24 +91,68 @@ async function idbPut(key: string, value: IdentityRecord): Promise<void> {
   });
 }
 
-let identity: IdentityRecord | null = null;
+let ring: KeyringRecord | null = null;
 
-export async function loadIdentity(userId: number): Promise<{ publicPem: string; fingerprint: string }> {
-  let rec = await idbGet(`user:${userId}`);
-  if (!rec) {
-    const pair = (await crypto.subtle.generateKey({ name: "X25519" }, false, ["deriveBits"])) as CryptoKeyPair;
-    const spki = new Uint8Array(await crypto.subtle.exportKey("spki", pair.publicKey));
-    rec = { privateKey: pair.privateKey, publicPem: spkiToPem(spki) };
-    await idbPut(`user:${userId}`, rec);
-  }
-  identity = rec;
-  return { publicPem: rec.publicPem, fingerprint: await fingerprint(rec.publicPem) };
+/** Every private key this browser holds for the signed-in user, active one first. */
+export function identities(): IdentityRecord[] {
+  if (!ring) return [];
+  return [ring.active, ...ring.all.filter((r) => r.publicPem !== ring!.active.publicPem)];
 }
 
-export async function deriveSharedKey(peerPem: string): Promise<CryptoKey> {
-  if (!identity) throw new Error("Identity not loaded");
+export async function loadIdentity(userId: number): Promise<{ publicPem: string; fingerprint: string }> {
+  let rec = await idbGet<KeyringRecord>(`keyring:${userId}`);
+  if (!rec) {
+    let first = await idbGet<IdentityRecord>(`user:${userId}`); // single-key format from older builds
+    if (!first) {
+      const pair = (await crypto.subtle.generateKey({ name: "X25519" }, false, ["deriveBits"])) as CryptoKeyPair;
+      const spki = new Uint8Array(await crypto.subtle.exportKey("spki", pair.publicKey));
+      first = { privateKey: pair.privateKey, publicPem: spkiToPem(spki) };
+    }
+    rec = { active: first, all: [first] };
+    await idbPut(`keyring:${userId}`, rec);
+  }
+  ring = rec;
+  return { publicPem: rec.active.publicPem, fingerprint: await fingerprint(rec.active.publicPem) };
+}
+
+/**
+ * Import a PEM (PKCS#8) X25519 private key, e.g. the Python client's `user<N>_identity.key`.
+ * The key is added to the keyring; with `makeActive` it also becomes the key used for new messages.
+ */
+export async function importIdentity(userId: number, pemText: string, makeActive: boolean): Promise<{ publicPem: string; fingerprint: string; isNew: boolean }> {
+  if (!ring) throw new Error("Identity not loaded");
+  const m = /-----BEGIN PRIVATE KEY-----([\s\S]+?)-----END PRIVATE KEY-----/.exec(pemText);
+  if (!m) throw new Error("That file isn't an unencrypted PEM private key (expected \"BEGIN PRIVATE KEY\").");
+  let jwk: JsonWebKey;
+  try {
+    const tmp = await crypto.subtle.importKey("pkcs8", b64decode(m[1].replace(/\s+/g, "")), { name: "X25519" }, true, ["deriveBits"]);
+    jwk = await crypto.subtle.exportKey("jwk", tmp);
+  } catch {
+    throw new Error("That file isn't an X25519 private key.");
+  }
+  if (!jwk.x) throw new Error("Could not read the public half of that key.");
+  const x = b64decode(jwk.x.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (jwk.x.length % 4)) % 4));
+  const spki = new Uint8Array(SPKI_PREFIX.length + x.length);
+  spki.set(SPKI_PREFIX);
+  spki.set(x, SPKI_PREFIX.length);
+  const publicPem = spkiToPem(spki);
+  // Re-import as non-extractable so the stored copy can never be read back out.
+  const privateKey = await crypto.subtle.importKey("jwk", { ...jwk, ext: false, key_ops: ["deriveBits"] }, { name: "X25519" }, false, ["deriveBits"]);
+
+  const existing = ring.all.find((r) => r.publicPem === publicPem);
+  const rec = existing ?? { privateKey, publicPem };
+  const next: KeyringRecord = { active: makeActive ? rec : ring.active, all: existing ? ring.all : [...ring.all, rec] };
+  await idbPut(`keyring:${userId}`, next);
+  ring = next;
+  return { publicPem, fingerprint: await fingerprint(publicPem), isNew: !existing };
+}
+
+/** AES key for the pair (one of my private keys, a peer public key). Defaults to the active key. */
+export async function deriveSharedKey(peerPem: string, mine?: IdentityRecord): Promise<CryptoKey> {
+  const me = mine ?? ring?.active;
+  if (!me) throw new Error("Identity not loaded");
   const peerKey = await crypto.subtle.importKey("spki", pemToSpki(peerPem), { name: "X25519" }, false, []);
-  const secret = await crypto.subtle.deriveBits({ name: "X25519", public: peerKey }, identity.privateKey, 256);
+  const secret = await crypto.subtle.deriveBits({ name: "X25519", public: peerKey }, me.privateKey, 256);
   const hkdfKey = await crypto.subtle.importKey("raw", secret, "HKDF", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
     { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: HKDF_INFO },
