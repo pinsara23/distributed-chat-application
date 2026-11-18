@@ -175,6 +175,47 @@ curl http://localhost/health/ready     # PostgreSQL, Redis and RabbitMQ all "ok"
 IMAGE_TAG=<commit-sha> docker compose up -d   # pin or roll back to a specific build
 ```
 
+## Web UI (WhatsApp-style)
+
+A browser frontend lives in [`frontend-ts/`](frontend-ts/) (TypeScript, Vite + React 18). It speaks the same E2EE protocol as
+`client/main.py` using the Web Crypto API (X25519 + HKDF + AES-GCM with the same AAD), so browser and terminal clients can
+chat with each other. The backend is unchanged.
+
+The backend has no CORS middleware, so the browser talks to a same-origin proxy that forwards `/backend/<port>/...` (REST and
+WebSocket) to `127.0.0.1:<port>` (8000-8003 only): the Vite dev server in development, `frontend-ts/serve.py` for the build.
+Start the three servers as above, then:
+
+```powershell
+cd frontend-ts
+npm install
+npm run dev                 # http://localhost:3000 (dev server with the proxy)
+```
+
+or build once and serve without Node:
+
+```powershell
+npm run build               # type-checks, then writes dist/
+conda activate chat-stage2
+python serve.py             # http://localhost:3000 (FRONTEND_PORT to change)
+```
+
+Open `http://localhost:3000`, create an account, and start a chat with another user's **user ID** (shown under your name).
+Use two browser tabs (or two browsers) with different accounts to try the multi-server demo; "Auto" server mode fails over
+between 8001-8003. Needs Chrome/Edge 133+, Firefox 130+ or Safari 17+ (X25519 in Web Crypto) on `localhost` or HTTPS.
+
+Features: unread badges, online status, security-code (TOFU) warnings, emoji picker, in-chat search (Enter / Shift+Enter to
+step through matches), per-chat drafts, "scroll to latest" button, copy message, desktop notifications, `Ctrl/Cmd+K` to focus
+chat search and `Esc` to close a chat.
+
+Notes / limits (because the backend API is unchanged):
+- No user search or profile names: contacts are user IDs; the display name you give a contact is stored only in your browser.
+- The server does not say who a conversation is with; the UI infers it from messages or asks you to confirm the ID.
+- Identity keys live in this browser's IndexedDB (non-extractable). Clearing site data, or signing in from another browser or
+  the Python client, creates a new key: old messages from before the change can no longer be decrypted and peers see a
+  "security code changed" prompt (TOFU).
+- Only a single tick is shown (stored on server); there are no delivery/read receipts, typing indicators or media.
+- Message history is re-downloaded and decrypted on each load; no plaintext is saved in the browser.
+
 ## Running the clients
 
 The same client serves every user; configure it with environment variables (a `CHAT_USER_ID`-based prefix keeps each
