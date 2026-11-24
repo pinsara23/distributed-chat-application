@@ -1,0 +1,32 @@
+# One-shot database migration (alembic upgrade head), the same as the compose
+# `migrate` service. A Job cannot be re-applied once it exists, so to run it
+# again (e.g. after a release that changes the schema):
+#   kubectl delete job migrate -n chat --ignore-not-found
+#   kubectl apply -f k8s/20-migrate-job.yaml
+#   kubectl wait --for=condition=complete job/migrate -n chat --timeout=300s
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: chat
+spec:
+  backoffLimit: 4
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:15-alpine
+          command: ["sh", "-c", "until pg_isready -h postgres -p 5432; do echo waiting for postgres; sleep 2; done"]
+      containers:
+        - name: migrate
+          image: pinsara23/distributed-chat:latest
+          imagePullPolicy: Always
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - secretRef: { name: chat-secrets }
+          env:
+            # $(VAR) is expanded by Kubernetes from the secret values above.
+            - name: DATABASE_URL
+              value: postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres:5432/$(POSTGRES_DB)

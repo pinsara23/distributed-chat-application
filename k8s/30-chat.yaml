@@ -1,0 +1,80 @@
+# Chat servers: one Deployment with 3 interchangeable replicas (they share the
+# RabbitMQ queue and use Redis for presence/pub-sub). Each pod's SERVER_ID is
+# its pod name, so presence ownership stays unique per pod.
+# Reachable inside the cluster as chat:8000; the web pod proxies to it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: chat
+  namespace: chat
+spec:
+  selector:
+    app: chat
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat
+  namespace: chat
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: chat
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0   # never drop below 3 ready pods during an update
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: chat
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: chat
+          image: pinsara23/distributed-chat:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - secretRef: { name: chat-secrets }
+          env:
+            - name: SERVER_ID
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            # $(VAR) is expanded by Kubernetes from the secret values above.
+            - name: DATABASE_URL
+              value: postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres:5432/$(POSTGRES_DB)
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+            - name: RABBITMQ_URL
+              value: amqp://$(RABBITMQ_USER):$(RABBITMQ_PASSWORD)@rabbitmq:5672/
+          # /health/live has no dependencies, like the compose healthcheck. The
+          # app keeps serving while RabbitMQ is down, so readiness deliberately
+          # does not use /health/ready (a broker blip would take every pod out).
+          startupProbe:
+            httpGet: { path: /health/live, port: 8000 }
+            periodSeconds: 3
+            failureThreshold: 20
+          readinessProbe:
+            httpGet: { path: /health/live, port: 8000 }
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: /health/live, port: 8000 }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            # Give the Service a moment to stop routing here before uvicorn
+            # receives SIGTERM and closes its WebSockets (clients reconnect).
+            preStop:
+              exec: { command: ["sleep", "5"] }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 384Mi }

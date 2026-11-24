@@ -1,0 +1,57 @@
+# Daily PostgreSQL backup (pg_dump custom format) at 03:00 server time,
+# written to /srv/chat-backups on the server; dumps older than 7 days are
+# deleted. Restore one with:
+#   kubectl exec -i -n chat postgres-0 -- sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists' < /srv/chat-backups/chat_db_YYYYMMDD_HHMMSS.dump
+# Run a backup now:
+#   kubectl create job -n chat --from=cronjob/postgres-backup backup-now
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: chat
+spec:
+  schedule: "0 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: postgres:15-alpine
+              env:
+                - name: PGHOST
+                  value: postgres
+                - name: PGUSER
+                  valueFrom: { secretKeyRef: { name: chat-secrets, key: POSTGRES_USER } }
+                - name: PGPASSWORD
+                  valueFrom: { secretKeyRef: { name: chat-secrets, key: POSTGRES_PASSWORD } }
+                - name: PGDATABASE
+                  valueFrom: { secretKeyRef: { name: chat-secrets, key: POSTGRES_DB } }
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  backup="/backups/chat_db_$(date +%Y%m%d_%H%M%S).dump"
+                  if pg_dump -F c -f "$backup.tmp"; then
+                    mv "$backup.tmp" "$backup"
+                    echo "Backup completed: $backup"
+                    find /backups -type f -name 'chat_db_*.dump' -mtime +7 -delete
+                  else
+                    rm -f "$backup.tmp"
+                    echo "Backup failed!" >&2
+                    exit 1
+                  fi
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+          volumes:
+            - name: backups
+              hostPath:
+                path: /srv/chat-backups
+                type: DirectoryOrCreate

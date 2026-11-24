@@ -1,0 +1,26 @@
+# Public entry point through k3s's built-in Traefik ingress (ports 80/443 on
+# the server). Traefik proxies WebSockets without extra configuration.
+#
+# HTTPS: the browser's end-to-end encryption (Web Crypto X25519) only works on
+# https:// or localhost. See k8s/README.md, "HTTPS", for the two options:
+#   A) Tailscale: leave this file as is (Tailscale terminates TLS).
+#   B) mkcert: create the chat-tls secret, then uncomment the tls: block.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chat
+  namespace: chat
+spec:
+  ingressClassName: traefik
+  # tls:
+  #   - secretName: chat-tls
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 80

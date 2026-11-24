@@ -132,3 +132,37 @@ jobs:
             ${{ env.IMAGE }}:${{ github.sha }}
           cache-from: type=gha,scope=chat-image
           cache-to: type=gha,mode=max,scope=chat-image
+
+  # Web UI image (frontend-ts -> nginx), used by k8s/40-web.yaml.
+  # `npm run build` type-checks first, so a TypeScript error fails this job.
+  build-and-push-web:
+    name: Build and push web UI image
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/distributed-chat-web
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push (latest + commit SHA)
+        uses: docker/build-push-action@v5
+        with:
+          context: frontend-ts
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha,scope=web-image
+          cache-to: type=gha,mode=max,scope=web-image

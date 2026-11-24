@@ -1,0 +1,124 @@
+# Web UI: nginx serving frontend-ts/dist (image built by CI from
+# frontend-ts/Dockerfile) and acting as the same-origin proxy that serve.py is
+# locally. The frontend calls /backend/<port>/<path>; every port goes to the
+# chat Service, which load-balances across the chat pods, so the UI's server
+# picker no longer pins a specific server (all choices behave like the
+# load balancer).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-nginx
+  namespace: chat
+data:
+  default.conf: |
+    # "Upgrade" for WebSocket handshakes, "close" for ordinary requests.
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    # Log the path only: the WebSocket URL carries the JWT in its query string.
+    log_format chat '$remote_addr [$time_local] "$request_method $uri" '
+                    '$status $body_bytes_sent rt=$request_time';
+
+    server {
+        listen 80;
+        server_tokens off;
+        access_log /var/log/nginx/access.log chat;
+
+        root /usr/share/nginx/html;
+
+        location = /healthz {
+            access_log off;
+            return 200 "ok\n";
+        }
+
+        # Hashed build assets never change, so they can be cached for long.
+        location /assets/ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+
+        location / {
+            try_files $uri /index.html;
+            add_header Cache-Control "no-cache";
+        }
+
+        # /backend/<port>/<path>?<query>  ->  http://chat:8000/<path>?<query>
+        # Malformed /backend/... paths (no numeric port) are rejected; the regex
+        # location below takes precedence for valid ones.
+        location /backend/ {
+            return 404;
+        }
+        location ~ ^/backend/[0-9]+/ {
+            rewrite ^/backend/[0-9]+/(.*)$ /$1 break;
+            proxy_pass http://chat.chat.svc.cluster.local:8000;
+
+            proxy_http_version 1.1;
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Upgrade           $http_upgrade;
+            proxy_set_header Connection        $connection_upgrade;
+
+            client_max_body_size 1m;
+            # Clients ping every 10 s; the server drops silent sockets after 45 s.
+            proxy_read_timeout 120s;
+            proxy_send_timeout 120s;
+        }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: chat
+spec:
+  selector:
+    app: web
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: chat
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+      annotations:
+        # Bump (or let deploy.sh set) to restart nginx after editing the ConfigMap.
+        config-version: "1"
+    spec:
+      containers:
+        - name: web
+          image: pinsara23/distributed-chat-web:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet: { path: /healthz, port: 80 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 80 }
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 20m, memory: 16Mi }
+            limits: { memory: 64Mi }
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+      volumes:
+        - name: nginx-conf
+          configMap:
+            name: web-nginx
